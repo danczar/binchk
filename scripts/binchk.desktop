@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=binchk
+Comment=Checks new executables in your downloads
+Exec=binchk
+Icon=binchk
+Terminal=false
+Categories=Utility;Security;

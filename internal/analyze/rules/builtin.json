@@ -1,0 +1,810 @@
+[
+  {
+    "id": "ransom-recovery-inhibit",
+    "title": "Deletes backups / shadow copies",
+    "description": "Commands used by ransomware to prevent recovery of encrypted files.",
+    "category": "impact",
+    "severity": "high",
+    "strings": [
+      "vssadmin delete shadows",
+      "vssadmin.exe delete shadows",
+      "shadowcopy delete",
+      "wbadmin delete catalog",
+      "recoveryenabled no",
+      "bootstatuspolicy ignoreallfailures",
+      "resize shadowstorage",
+      "Win32_ShadowCopy"
+    ]
+  },
+  {
+    "id": "ransom-note",
+    "title": "Ransom note text",
+    "description": "Phrases typical of ransom notes.",
+    "category": "impact",
+    "severity": "high",
+    "strings": [
+      "your files have been encrypted",
+      "all your files are encrypted",
+      "files are encrypted",
+      "decrypt your files",
+      "to recover your files",
+      "your personal id",
+      "private key will be destroyed",
+      "buy bitcoin",
+      "download tor browser",
+      "decryption key",
+      "restore your files"
+    ],
+    "min": 2
+  },
+  {
+    "id": "miner-pool",
+    "title": "Cryptocurrency mining pool protocol",
+    "description": "Stratum mining-pool URLs indicate a cryptominer.",
+    "category": "impact",
+    "severity": "high",
+    "strings": [
+      "stratum+tcp://",
+      "stratum+ssl://",
+      "stratum2+tcp://",
+      "stratum+tls://"
+    ]
+  },
+  {
+    "id": "miner-strings",
+    "title": "Cryptominer artifacts",
+    "category": "impact",
+    "severity": "medium",
+    "strings": [
+      "xmrig",
+      "cryptonight",
+      "randomx",
+      "--donate-level",
+      "nicehash",
+      "minexmr",
+      "supportxmr",
+      "nanopool.org",
+      "moneroocean",
+      "hashvault.pro",
+      "2miners.com",
+      "nr_hugepages",
+      "msr_mod"
+    ],
+    "min": 2,
+    "escalate_at": 3,
+    "escalate_to": "high"
+  },
+  {
+    "id": "stealer-browsers",
+    "title": "Enumerates many browser profiles",
+    "description": "Infostealers walk the profile directories of many different browsers to harvest passwords and cookies.",
+    "category": "credential-access",
+    "severity": "high",
+    "strings": [
+      "Google\\Chrome\\User Data",
+      "Google/Chrome/",
+      "Microsoft\\Edge\\User Data",
+      "Microsoft Edge/",
+      "BraveSoftware\\Brave-Browser",
+      "BraveSoftware/Brave-Browser",
+      "Opera Software\\Opera Stable",
+      "com.operasoftware.Opera",
+      "Yandex\\YandexBrowser",
+      "Vivaldi\\User Data",
+      "Chromium\\User Data",
+      "Mozilla\\Firefox\\Profiles",
+      "Firefox/Profiles",
+      "CocCoc\\Browser",
+      "Epic Privacy Browser",
+      "Comodo\\Dragon",
+      "Torch\\User Data",
+      "Arc/User Data",
+      "Chrome Beta/",
+      "Chrome Canary/"
+    ],
+    "min": 5
+  },
+  {
+    "id": "stealer-cred-files",
+    "title": "References browser credential stores",
+    "category": "credential-access",
+    "severity": "medium",
+    "strings": [
+      "Login Data",
+      "logins.json",
+      "key4.db",
+      "key3.db",
+      "signons.sqlite",
+      "encrypted_key",
+      "Cookies.binarycookies",
+      "cookies.sqlite",
+      "Web Data",
+      "Local State",
+      "formhistory.sqlite"
+    ],
+    "min": 3,
+    "escalate_at": 5,
+    "escalate_to": "high"
+  },
+  {
+    "id": "stealer-wallets",
+    "title": "Targets cryptocurrency wallets",
+    "description": "Wallet files and wallet-extension IDs are harvested by stealers.",
+    "category": "credential-access",
+    "severity": "high",
+    "strings": [
+      "wallet.dat",
+      "exodus.wallet",
+      "Exodus\\exodus.wallet",
+      "Electrum\\wallets",
+      "electrum/wallets",
+      "atomic\\Local Storage\\leveldb",
+      "Ethereum\\keystore",
+      "Ethereum/keystore",
+      "com.liberty.jaxx",
+      "Coinomi\\wallets",
+      "Guarda\\Local Storage",
+      "Armory\\",
+      "Bitcoin\\wallets",
+      "Monero\\wallets",
+      "Zcash\\wallet",
+      "Binance\\app-store.json",
+      "Ledger Live\\app.json",
+      "atomic/Local Storage/leveldb",
+      "nkbihfbeogaeaoehlefnkodbefgpgknn",
+      "bfnaelmomeimhlpmgjnjophhpkkoljpa",
+      "ibnejdfjmmkpcnlpebklmnkoeoihofec",
+      "hnfanknocfeofbddgcijnmhnfnkdnaad",
+      "fhbohimaelbohpjbbldcngcnapndodjp",
+      "egjidjbpglichdcondbcbdnbeeppgdph",
+      "aholpfdialjgjfhomihkjbmgjidlcdno",
+      "acmacodkjbdgmoleebolmdjonilkdbch"
+    ],
+    "min": 2,
+    "escalate_at": 0
+  },
+  {
+    "id": "stealer-apps",
+    "title": "Targets messaging / gaming / VPN credentials",
+    "category": "credential-access",
+    "severity": "medium",
+    "strings": [
+      "discord\\Local Storage\\leveldb",
+      "discordcanary",
+      "Telegram Desktop\\tdata",
+      "Telegram Desktop/tdata",
+      "Local Storage\\leveldb",
+      "Steam\\config",
+      "loginusers.vdf",
+      "FileZilla\\recentservers.xml",
+      "sitemanager.xml",
+      "NordVPN",
+      "OpenVPN Connect",
+      "ProtonVPN",
+      "Pidgin\\accounts.xml",
+      "Thunderbird\\Profiles"
+    ],
+    "min": 3
+  },
+  {
+    "id": "keychain-theft",
+    "title": "Accesses macOS keychain secrets",
+    "category": "credential-access",
+    "severity": "low",
+    "strings": [
+      "security find-generic-password",
+      "security dump-keychain",
+      "login.keychain-db",
+      "Chrome Safe Storage",
+      "Brave Safe Storage",
+      "Microsoft Edge Safe Storage",
+      "security unlock-keychain"
+    ],
+    "escalate_at": 2,
+    "escalate_to": "high"
+  },
+  {
+    "id": "mac-fake-password-prompt",
+    "title": "Fake password dialog (osascript)",
+    "description": "Mac stealers such as AMOS pop an AppleScript dialog with a hidden answer field to phish the login password.",
+    "category": "credential-access",
+    "severity": "high",
+    "strings": [
+      "display dialog",
+      "with hidden answer",
+      "dscl . authonly",
+      "dscl /Local/Default -authonly"
+    ],
+    "min": 2
+  },
+  {
+    "id": "unix-secret-files",
+    "title": "Reads SSH keys / cloud credentials",
+    "category": "credential-access",
+    "severity": "medium",
+    "strings": [
+      "/.ssh/id_rsa",
+      "/.ssh/id_ed25519",
+      "/etc/shadow",
+      "/.aws/credentials",
+      "/.kube/config",
+      "/.docker/config.json",
+      "/.git-credentials",
+      "/.netrc",
+      "/.bash_history",
+      "/.zsh_history",
+      "/.gnupg/",
+      "/.config/gcloud"
+    ],
+    "min": 2,
+    "escalate_at": 4,
+    "escalate_to": "high"
+  },
+  {
+    "id": "win-secret-stores",
+    "title": "Targets Windows credential stores",
+    "category": "credential-access",
+    "severity": "medium",
+    "strings": [
+      "reg save hklm\\sam",
+      "reg.exe save hklm\\sam",
+      "reg save hklm\\security",
+      "ntds.dit",
+      "vaultcmd",
+      "\\Microsoft\\Credentials",
+      "\\Microsoft\\Protect\\",
+      "SAM\\SAM\\Domains"
+    ],
+    "escalate_at": 2,
+    "escalate_to": "high"
+  },
+  {
+    "id": "lsass-dump",
+    "title": "Dumps LSASS process memory",
+    "category": "credential-access",
+    "severity": "high",
+    "strings": [
+      "lsass.exe",
+      "MiniDumpWriteDump",
+      "comsvcs.dll, MiniDump",
+      "comsvcs.dll MiniDump",
+      "sekurlsa"
+    ],
+    "min": 2
+  },
+  {
+    "id": "keylogger-strings",
+    "title": "Keylogger key-name markers",
+    "category": "collection",
+    "severity": "medium",
+    "strings": [
+      "[ENTER]",
+      "[BACKSPACE]",
+      "[TAB]",
+      "[CAPSLOCK]",
+      "[SHIFT]",
+      "[CTRL]",
+      "[ESC]",
+      "[DELETE]",
+      "keylog"
+    ],
+    "min": 4
+  },
+  {
+    "id": "offensive-tools",
+    "title": "Known offensive / post-exploitation tool",
+    "category": "offensive-tooling",
+    "severity": "high",
+    "strings": [
+      "mimikatz",
+      "sekurlsa::",
+      "kerberos::golden",
+      "lsadump::",
+      "Invoke-Mimikatz",
+      "ReflectiveLoader",
+      "meterpreter",
+      "metsrv",
+      "cobaltstrike",
+      "beacon.x64.dll",
+      "PowerSploit",
+      "Invoke-Shellcode",
+      "SharpHound",
+      "Rubeus",
+      "sliverpb",
+      "LaZagne",
+      "Invoke-ReflectivePEInjection",
+      "Brute Ratel",
+      "havoc demon"
+    ]
+  },
+  {
+    "id": "uac-bypass",
+    "title": "UAC bypass technique",
+    "category": "privilege-escalation",
+    "severity": "high",
+    "strings": [
+      "ms-settings\\Shell\\Open\\command",
+      "mscfile\\shell\\open\\command",
+      "Classes\\exefile\\shell\\runas",
+      "fodhelper",
+      "computerdefaults.exe",
+      "sdclt.exe",
+      "DelegateExecute",
+      "eventvwr.exe"
+    ],
+    "min": 2
+  },
+  {
+    "id": "rootkit-linux",
+    "title": "Linux rootkit techniques",
+    "category": "defense-evasion",
+    "severity": "medium",
+    "strings": [
+      "sys_call_table",
+      "kallsyms_lookup_name",
+      "hide_pid",
+      "hidden_process",
+      "hide_module",
+      "__x64_sys_getdents64",
+      "ftrace_set_filter_ip",
+      "hide_port"
+    ],
+    "min": 2,
+    "escalate_at": 3,
+    "escalate_to": "high"
+  },
+  {
+    "id": "ld-preload-hijack",
+    "title": "Writes /etc/ld.so.preload",
+    "description": "Userland rootkits persist by injecting a library into every process via /etc/ld.so.preload.",
+    "category": "persistence",
+    "severity": "high",
+    "strings": [
+      "/etc/ld.so.preload"
+    ]
+  },
+  {
+    "id": "powershell-abuse",
+    "title": "Obfuscated / hidden PowerShell",
+    "category": "execution",
+    "severity": "low",
+    "strings": [
+      "powershell -enc",
+      "powershell.exe -enc",
+      "-EncodedCommand",
+      "-ExecutionPolicy Bypass",
+      "-ep bypass",
+      "-nop -w hidden",
+      "-WindowStyle Hidden",
+      "IEX (New-Object",
+      "IEX(New-Object",
+      "Net.WebClient).DownloadString",
+      "DownloadString(",
+      "Invoke-Expression",
+      "FromBase64String(",
+      "Start-BitsTransfer"
+    ],
+    "escalate_at": 3,
+    "escalate_to": "high"
+  },
+  {
+    "id": "lolbin-download",
+    "title": "Downloads via living-off-the-land binaries",
+    "category": "execution",
+    "severity": "medium",
+    "strings": [
+      "certutil -urlcache",
+      "certutil.exe -urlcache",
+      "bitsadmin /transfer",
+      "mshta http",
+      "mshta.exe http",
+      "regsvr32 /s /n /u /i:http",
+      "rundll32 javascript:",
+      "msiexec /q /i http",
+      "cmd /c curl",
+      "curl -fsSL http",
+      "wget -q -O -",
+      "curl -s http",
+      "curl -fsSL http | sh",
+      "| sh -s --",
+      "wget -qO- http"
+    ],
+    "escalate_at": 2,
+    "escalate_to": "high"
+  },
+  {
+    "id": "reverse-shell",
+    "title": "Reverse shell one-liner",
+    "category": "command-and-control",
+    "severity": "high",
+    "strings": [
+      "/dev/tcp/",
+      "bash -i >&",
+      "sh -i >&",
+      "nc -e /bin/sh",
+      "nc -e /bin/bash",
+      "ncat -e",
+      "mkfifo /tmp/",
+      "socat exec:",
+      "import socket,subprocess",
+      "0<&196"
+    ]
+  },
+  {
+    "id": "persist-windows",
+    "title": "Windows autostart persistence",
+    "category": "persistence",
+    "severity": "low",
+    "strings": [
+      "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+      "CurrentVersion\\RunOnce",
+      "Policies\\Explorer\\Run",
+      "Winlogon\\Shell",
+      "Winlogon\\Userinit",
+      "schtasks /create",
+      "schtasks.exe /create",
+      "\\Start Menu\\Programs\\Startup",
+      "Image File Execution Options",
+      "AppInit_DLLs"
+    ],
+    "escalate_at": 3,
+    "escalate_to": "medium"
+  },
+  {
+    "id": "persist-macos",
+    "title": "macOS launch persistence",
+    "category": "persistence",
+    "severity": "low",
+    "strings": [
+      "Library/LaunchAgents",
+      "Library/LaunchDaemons",
+      "launchctl load",
+      "launchctl bootstrap",
+      "com.apple.loginitems",
+      "/Library/StartupItems",
+      "RunAtLoad",
+      "KeepAlive",
+      "LSSharedFileListInsertItemURL"
+    ],
+    "min": 2,
+    "escalate_at": 5,
+    "escalate_to": "medium"
+  },
+  {
+    "id": "persist-linux",
+    "title": "Linux persistence locations",
+    "category": "persistence",
+    "severity": "low",
+    "strings": [
+      "/etc/rc.local",
+      "/etc/cron.d/",
+      "crontab -",
+      "/var/spool/cron",
+      "systemctl enable",
+      ".config/autostart",
+      "/etc/systemd/system/",
+      "/.bashrc",
+      "/.bash_profile",
+      "authorized_keys",
+      "/etc/init.d/",
+      "/etc/profile.d/"
+    ],
+    "min": 2,
+    "escalate_at": 5,
+    "escalate_to": "medium"
+  },
+  {
+    "id": "evasion-windows",
+    "title": "Disables Windows security controls",
+    "category": "defense-evasion",
+    "severity": "medium",
+    "strings": [
+      "DisableRealtimeMonitoring",
+      "DisableAntiSpyware",
+      "Add-MpPreference -ExclusionPath",
+      "AmsiScanBuffer",
+      "EtwEventWrite",
+      "netsh advfirewall set allprofiles state off",
+      "wevtutil cl",
+      "Clear-EventLog",
+      "sc stop WinDefend",
+      "MsMpEng.exe",
+      "DisableBehaviorMonitoring"
+    ],
+    "escalate_at": 2,
+    "escalate_to": "high"
+  },
+  {
+    "id": "evasion-macos",
+    "title": "Bypasses macOS Gatekeeper / TCC",
+    "category": "defense-evasion",
+    "severity": "low",
+    "strings": [
+      "xattr -d com.apple.quarantine",
+      "xattr -r -d com.apple.quarantine",
+      "xattr -rd com.apple.quarantine",
+      "xattr -dr com.apple.quarantine",
+      "spctl --master-disable",
+      "spctl --global-disable",
+      "csrutil disable",
+      "tccutil reset",
+      "TCC.db"
+    ],
+    "escalate_at": 2,
+    "escalate_to": "high"
+  },
+  {
+    "id": "evasion-linux",
+    "title": "Tampers with Linux logging / security",
+    "category": "defense-evasion",
+    "severity": "medium",
+    "strings": [
+      "setenforce 0",
+      "unset HISTFILE",
+      "history -c",
+      "HISTFILE=/dev/null",
+      "rm -rf /var/log",
+      "chattr +i",
+      "iptables -F",
+      "ufw disable",
+      "/proc/sys/kernel/nmi_watchdog",
+      "systemctl stop apparmor",
+      "echo 0 > /proc/sys/kernel/"
+    ],
+    "escalate_at": 2,
+    "escalate_to": "high"
+  },
+  {
+    "id": "anti-analysis",
+    "title": "Detects VMs, sandboxes or analysis tools",
+    "category": "defense-evasion",
+    "severity": "low",
+    "strings": [
+      "VBoxService",
+      "VBoxTray",
+      "VBoxGuest",
+      "vmtoolsd",
+      "VMware Tools",
+      "vmci.sys",
+      "SbieDll.dll",
+      "SandboxieRpcSs",
+      "wine_get_unix_file_name",
+      "QEMU HARDDISK",
+      "VIRTUAL HARDDISK",
+      "prl_tools",
+      "wireshark",
+      "procmon",
+      "x64dbg",
+      "ollydbg",
+      "processhacker",
+      "idaq64",
+      "fiddler"
+    ],
+    "min": 2,
+    "escalate_at": 4,
+    "escalate_to": "medium"
+  },
+  {
+    "id": "exfil-webhooks",
+    "title": "Sends data to chat webhooks / bot APIs",
+    "description": "Discord webhooks and Telegram bot APIs are the most common drop points for stolen data.",
+    "category": "command-and-control",
+    "severity": "medium",
+    "strings": [
+      "discord.com/api/webhooks",
+      "discordapp.com/api/webhooks",
+      "api.telegram.org/bot"
+    ]
+  },
+  {
+    "id": "exfil-services",
+    "title": "References paste, tunnel or request-capture services",
+    "description": "Often used for exfiltration or C2, though developer tools reference them too.",
+    "category": "command-and-control",
+    "severity": "low",
+    "strings": [
+      "pastebin.com/raw",
+      "transfer.sh",
+      "anonfiles",
+      "gofile.io",
+      "ngrok.io",
+      "ngrok-free.app",
+      "webhook.site",
+      "requestbin",
+      "interact.sh",
+      "oastify.com",
+      "burpcollaborator",
+      "trycloudflare.com",
+      "hooks.slack.com/services"
+    ],
+    "escalate_at": 3,
+    "escalate_to": "medium"
+  },
+  {
+    "id": "tor",
+    "title": "Uses Tor",
+    "category": "command-and-control",
+    "severity": "medium",
+    "strings": [
+      "tor2web",
+      "127.0.0.1:9050",
+      "127.0.0.1:9150",
+      "socks5h://",
+      ".onion/"
+    ]
+  },
+  {
+    "id": "privilege-strings",
+    "title": "Requests debug privilege",
+    "category": "privilege-escalation",
+    "severity": "low",
+    "strings": [
+      "SeDebugPrivilege"
+    ]
+  },
+  {
+    "id": "discovery",
+    "title": "System discovery commands",
+    "category": "discovery",
+    "severity": "low",
+    "strings": [
+      "whoami",
+      "systeminfo",
+      "ipconfig /all",
+      "net user",
+      "net localgroup administrators",
+      "tasklist",
+      "nltest /domain_trusts",
+      "net group \"domain admins\"",
+      "uname -a",
+      "sw_vers",
+      "system_profiler",
+      "arp -a",
+      "netstat -ano"
+    ],
+    "min": 4,
+    "escalate_at": 6,
+    "escalate_to": "medium"
+  },
+  {
+    "id": "packer-upx",
+    "title": "Packed with UPX",
+    "description": "Executable compression hides the real code from static analysis. Some legitimate tools use UPX, but it is common in malware.",
+    "category": "packer",
+    "severity": "medium",
+    "strings": [
+      "UPX!",
+      "$Info: This file is packed with the UPX"
+    ],
+    "case_sensitive": true
+  },
+  {
+    "id": "packer-other",
+    "title": "Commercial packer / protector",
+    "category": "packer",
+    "severity": "medium",
+    "strings": [
+      ".MPRESS1",
+      ".themida",
+      ".vmp0",
+      ".vmp1",
+      ".aspack",
+      ".enigma1",
+      "PECompact2",
+      ".nsp0",
+      "PELOCKnt",
+      "Obsidium"
+    ],
+    "case_sensitive": true
+  },
+  {
+    "id": "autoit",
+    "title": "AutoIt compiled script",
+    "description": "AutoIt is frequently abused to wrap malware payloads.",
+    "category": "execution",
+    "severity": "low",
+    "strings": [
+      "AU3!EA06",
+      "AutoIt v3"
+    ]
+  },
+  {
+    "id": "Rust",
+    "title": "",
+    "category": "toolchain",
+    "severity": "info",
+    "strings": [
+      "/rustc/",
+      "RUST_BACKTRACE"
+    ],
+    "case_sensitive": true
+  },
+  {
+    "id": "PyInstaller (Python bundle — embedded scripts not analysed)",
+    "title": "",
+    "category": "toolchain",
+    "severity": "info",
+    "strings": [
+      "_MEIPASS",
+      "PyInstaller",
+      "pyi-runtime-tmpdir"
+    ],
+    "case_sensitive": true
+  },
+  {
+    "id": "Nuitka (compiled Python)",
+    "title": "",
+    "category": "toolchain",
+    "severity": "info",
+    "strings": [
+      "NUITKA_ONEFILE_PARENT",
+      "nuitka"
+    ],
+    "case_sensitive": true
+  },
+  {
+    "id": "NSIS installer (payload in overlay)",
+    "title": "",
+    "category": "toolchain",
+    "severity": "info",
+    "strings": [
+      "Nullsoft Install System",
+      "NullsoftInst"
+    ],
+    "case_sensitive": true
+  },
+  {
+    "id": "Inno Setup installer (payload in overlay)",
+    "title": "",
+    "category": "toolchain",
+    "severity": "info",
+    "strings": [
+      "Inno Setup Setup Data"
+    ],
+    "case_sensitive": true
+  },
+  {
+    "id": "Electron",
+    "title": "",
+    "category": "toolchain",
+    "severity": "info",
+    "strings": [
+      "electron.asar",
+      "ELECTRON_RUN_AS_NODE"
+    ],
+    "case_sensitive": true
+  },
+  {
+    "id": "Nim",
+    "title": "",
+    "category": "toolchain",
+    "severity": "info",
+    "strings": [
+      "NimMain",
+      "nimGC_"
+    ],
+    "case_sensitive": true
+  },
+  {
+    "id": "Delphi",
+    "title": "",
+    "category": "toolchain",
+    "severity": "info",
+    "strings": [
+      "Borland\\Delphi",
+      "Embarcadero Delphi"
+    ],
+    "case_sensitive": true
+  },
+  {
+    "id": "Chromium browser engine",
+    "category": "toolchain",
+    "severity": "info",
+    "case_sensitive": true,
+    "strings": [
+      "chrome://version",
+      "chrome-extension://",
+      "Chromium Embedded Framework"
+    ]
+  }
+]

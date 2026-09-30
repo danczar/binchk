@@ -1,0 +1,6 @@
+/bin/
+/dist/
+/.preview/
+*.test
+*.out
+.DS_Store

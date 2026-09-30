@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>binchk · {{.FileName}} · {{.Verdict}}</title>
+<style>
+:root{
+  --bg:#f6f7f9;--panel:#fff;--ink:#16181d;--muted:#5f6673;--line:#e3e6eb;--code:#f0f2f5;
+  --clean:#1f8a4c;--susp:#b86e00;--mal:#c62828;--err:#6b7280;
+  --critical:#8e0000;--high:#c62828;--medium:#c77700;--low:#2f6fb3;--info:#6b7280;
+  --accent:var(--clean);
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0f1115;--panel:#171a21;--ink:#e7e9ee;--muted:#9aa3b2;--line:#262b35;--code:#1e222b;
+  --clean:#3fbf7a;--susp:#f0a53a;--mal:#ff5a52;--critical:#ff6b6b;--high:#ff5a52;--medium:#f0a53a;--low:#6aa7ff;--info:#9aa3b2;
+}}
+.v-Clean{--accent:var(--clean)} .v-Suspicious{--accent:var(--susp)} .v-Malicious{--accent:var(--mal)} .v-Error{--accent:var(--err)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Ubuntu,sans-serif}
+main{max-width:1080px;margin:0 auto;padding:24px 16px 64px}
+code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+h2{font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:32px 0 10px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+.hero{border-top:5px solid var(--accent);display:grid;grid-template-columns:1fr auto;gap:18px;align-items:center}
+.hero h1{margin:0 0 4px;font-size:22px;word-break:break-all}
+.verdict{display:inline-block;background:var(--accent);color:#fff;font-weight:700;padding:3px 12px;border-radius:999px;font-size:13px;letter-spacing:.03em}
+.summary{margin:8px 0 0;color:var(--muted)}
+.gauge{width:108px;height:108px;border-radius:50%;display:grid;place-items:center;
+  background:conic-gradient(var(--accent) calc(var(--score)*1%),var(--line) 0)}
+.gauge div{width:84px;height:84px;border-radius:50%;background:var(--panel);display:grid;place-items:center;text-align:center}
+.gauge b{font-size:28px;line-height:1}.gauge small{color:var(--muted);font-size:11px}
+.meta{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px;color:var(--muted);font-size:13px}
+.meta b{color:var(--ink);font-weight:600}
+.note{margin-top:12px;padding:10px 12px;border-radius:8px;background:var(--code);font-size:13px}
+.finding{display:grid;grid-template-columns:86px 1fr;gap:12px;padding:12px 0;border-top:1px solid var(--line)}
+.finding:first-child{border-top:0;padding-top:0}
+.chip{display:inline-block;text-align:center;border-radius:6px;padding:2px 0;width:86px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#fff}
+.s-critical{background:var(--critical)}.s-high{background:var(--high)}.s-medium{background:var(--medium)}.s-low{background:var(--low)}.s-info{background:var(--info)}
+.finding h3{margin:0;font-size:14.5px}.finding p{margin:2px 0 0;color:var(--muted)}
+.ev{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+.ev code{background:var(--code);border:1px solid var(--line);border-radius:5px;padding:1px 6px;word-break:break-all}
+.cat{font-size:11px;color:var(--muted);margin-left:6px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:6px 8px;border-top:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:12px;border-top:0}
+td.k{color:var(--muted);width:180px;white-space:nowrap}
+.hash{cursor:pointer;word-break:break-all}.hash:hover{text-decoration:underline}
+.bar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;min-width:80px}
+.bar i{display:block;height:100%;background:var(--low)}
+.bar.warm i{background:var(--medium)}.bar.hot i{background:var(--high)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media (max-width:760px){.grid2{grid-template-columns:1fr}.hero{grid-template-columns:1fr}.finding{grid-template-columns:1fr}}
+svg.entropy{width:100%;height:120px;display:block}
+svg.entropy .area{fill:color-mix(in srgb,var(--accent) 35%,transparent);stroke:var(--accent);stroke-width:1.2;vector-effect:non-scaling-stroke}
+svg.entropy .thresh{stroke:var(--high);stroke-dasharray:4 4;stroke-width:1;vector-effect:non-scaling-stroke}
+.legend{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-top:4px}
+details{margin-top:10px}summary{cursor:pointer;color:var(--muted)}
+ul.plain{margin:0;padding-left:18px}ul.plain li{word-break:break-all}
+.tag{display:inline-block;font-size:11px;padding:0 6px;border-radius:4px;background:color-mix(in srgb,var(--medium) 20%,transparent);color:var(--medium);font-weight:600}
+.ok{color:var(--clean);font-weight:600}.bad{color:var(--high);font-weight:600}
+.muted{color:var(--muted)}
+h3.bundle{font-size:14.5px;margin:18px 0 6px;word-break:break-all}
+table.files td{vertical-align:top}
+table.files summary{color:var(--ink);word-break:break-all}
+.sub{color:var(--muted);font-size:12px;margin:6px 0 4px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.subf{font-size:12.5px;margin:3px 0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.chip.small{width:auto;padding:1px 6px;font-size:10px}
+.vchip{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:700;color:#fff;background:var(--err)}
+.vchip.v-Clean{background:var(--clean)}.vchip.v-Suspicious{background:var(--susp)}.vchip.v-Malicious{background:var(--mal)}
+footer{margin-top:40px;color:var(--muted);font-size:12px;text-align:center}
+#toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:6px 14px;border-radius:6px;opacity:0;transition:opacity .2s}
+</style>
+</head>
+<body class="v-{{.Verdict}}">
+<main>
+<section class="panel hero">
+  <div>
+    <span class="verdict">{{.Verdict}}</span>
+    <h1>{{.FileName}}</h1>
+    <p class="summary">{{.Summary}}</p>
+    <div class="meta">
+      <span><b>{{.Format}}</b>{{if .Arches}} · {{join .Arches ", "}}{{end}}</span>
+      <span><b>{{bytes .Size}}</b></span>
+      <span>analysed in <b>{{ms .Elapsed}}</b>{{if .Latency}} · report ready <b>{{ms .Latency}}</b> after detection{{end}}</span>
+      <span>{{time .AnalyzedAt}}</span>
+    </div>
+    {{if ne .StoredPath .OriginalPath}}<div class="note">🔒 Quarantined from <code>{{.OriginalPath}}</code>. Use the <b>binchk</b> menu to <b>Restore</b> or <b>Delete</b> it.</div>{{end}}
+    {{if .Truncated}}<div class="note">⏱ Analysis reached its time budget; some checks are incomplete.</div>{{end}}
+  </div>
+  <div class="gauge" style="--score:{{.Score}}"><div><span><b>{{.Score}}</b><br><small>risk / 100</small></span></div></div>
+</section>
+
+<h2>Findings ({{len .Findings}})</h2>
+<section class="panel">
+{{range .Findings}}
+  <div class="finding">
+    <div><span class="chip s-{{sev .Severity}}">{{sev .Severity}}</span></div>
+    <div>
+      <h3>{{.Title}}<span class="cat">{{.Category}}</span></h3>
+      {{if .Detail}}<p>{{.Detail}}</p>{{end}}
+      {{if .Evidence}}<div class="ev">{{range .Evidence}}<code>{{.}}</code>{{end}}</div>{{end}}
+    </div>
+  </div>
+{{else}}
+  <p>Nothing suspicious found.</p>
+{{end}}
+</section>
+
+{{with .Container}}
+<h2>Contents of this {{lower .Kind}}</h2>
+<section class="panel">
+  <p class="muted" style="margin-top:0">{{if .Volume}}Mounted read-only and hidden from Finder{{else if eq .Kind "Installer package"}}Unpacked by binchk into a private temporary folder{{else}}Inspected in place, with execute permissions removed{{end}}; nothing inside was run.</p>
+  {{range .Notes}}<div class="note">{{.}}</div>{{end}}
+  {{range .Bundles}}
+  <h3 class="bundle">{{if eq .Kind "Application"}}🧩{{else}}📦{{end}} {{.Path}} <span class="cat">{{.Kind}}</span></h3>
+  <table>{{range .Props}}{{if .V}}<tr><td class="k">{{.K}}</td><td>{{.V}}</td></tr>{{end}}{{end}}</table>
+  {{end}}
+  {{if .Files}}
+  <h3 class="bundle">Files analysed ({{len .Files}}{{if .Skipped}}, {{.Skipped}} skipped{{end}})</h3>
+  <table class="files">
+    <tr><th>File</th><th>Type</th><th>Verdict</th><th>Risk</th><th>Time</th></tr>
+    {{range .Files}}
+    <tr>
+      <td class="mono">
+        <details><summary>{{.Path}}</summary>
+          <div class="sub">{{.Format}}{{if .Arches}} · {{join .Arches ", "}}{{end}} · {{bytes .Size}}{{if .Signer}} · signed by {{.Signer}}{{end}}<br>SHA-256 {{.SHA256}}</div>
+          {{range .Findings}}<div class="subf"><span class="chip s-{{sev .Severity}} small">{{sev .Severity}}</span> {{.Title}}{{if .Evidence}} — <code>{{join .Evidence ", "}}</code>{{end}}</div>{{else}}<div class="sub">No findings.</div>{{end}}
+        </details>
+      </td>
+      <td>{{.Kind}}</td>
+      <td><span class="vchip v-{{.Verdict}}">{{.Verdict}}</span></td>
+      <td class="mono">{{.Score}}</td>
+      <td class="mono">{{ms .Elapsed}}</td>
+    </tr>
+    {{end}}
+  </table>
+  {{else}}<p>No executables or scripts were found inside.</p>{{end}}
+</section>
+{{end}}
+
+<div class="grid2">
+<div>
+<h2>Identity</h2>
+<section class="panel">
+<table>
+  <tr><td class="k">SHA-256</td><td class="mono hash" title="Click to copy">{{.Hashes.SHA256}}</td></tr>
+  <tr><td class="k">SHA-1</td><td class="mono hash" title="Click to copy">{{.Hashes.SHA1}}</td></tr>
+  <tr><td class="k">MD5</td><td class="mono hash" title="Click to copy">{{.Hashes.MD5}}</td></tr>
+  {{if .Hashes.Imphash}}<tr><td class="k">Imphash</td><td class="mono hash" title="Click to copy">{{.Hashes.Imphash}}</td></tr>{{end}}
+  <tr><td class="k">Original path</td><td class="mono">{{.OriginalPath}}</td></tr>
+  {{if ne .StoredPath .OriginalPath}}<tr><td class="k">Quarantine</td><td class="mono">{{.StoredPath}}</td></tr>{{end}}
+  <tr><td class="k">Detected</td><td>{{time .DetectedAt}}</td></tr>
+  {{with .Provenance}}
+    {{if .Source}}<tr><td class="k">Downloaded from</td><td class="mono">{{.Source}}</td></tr>{{end}}
+    {{if .Referrer}}<tr><td class="k">Referrer</td><td class="mono">{{.Referrer}}</td></tr>{{end}}
+    {{if .Agent}}<tr><td class="k">Downloaded by</td><td>{{.Agent}}</td></tr>{{end}}
+    {{if .Zone}}<tr><td class="k">Security zone</td><td>{{.Zone}}</td></tr>{{end}}
+  {{end}}
+</table>
+</section>
+</div>
+<div>
+<h2>Signature</h2>
+<section class="panel">
+{{with .Signature}}
+{{if .Present}}
+<table>
+  <tr><td class="k">Type</td><td>{{.Kind}}{{if .AdHoc}} <span class="tag">ad-hoc</span>{{end}}</td></tr>
+  {{if .Signer}}<tr><td class="k">Signer</td><td>{{.Signer}}</td></tr>{{end}}
+  {{if .Issuer}}<tr><td class="k">Issued by</td><td>{{.Issuer}}</td></tr>{{end}}
+  {{if .TeamID}}<tr><td class="k">Team ID</td><td class="mono">{{.TeamID}}</td></tr>{{end}}
+  {{if .Identifier}}<tr><td class="k">Identifier</td><td class="mono">{{.Identifier}}</td></tr>{{end}}
+  {{if .NotAfter}}<tr><td class="k">Cert expires</td><td>{{.NotAfter}}</td></tr>{{end}}
+  {{if .Flags}}<tr><td class="k">Flags</td><td class="mono">{{join .Flags ", "}}</td></tr>{{end}}
+  {{if .Gatekeeper}}<tr><td class="k">Gatekeeper</td><td>{{if .Notarized}}<span class="ok">✔ {{.Gatekeeper}}</span>{{else}}{{.Gatekeeper}}{{end}}</td></tr>{{end}}
+  <tr><td class="k">OS verification</td><td>{{if hasVerify .Verified}}{{if eq (verified .Verified) "yes"}}<span class="ok">✔ valid</span>{{else}}<span class="bad">✘ failed</span>{{end}} <br><small>{{.VerifyDetail}}</small>{{else}}not available on this platform{{end}}</td></tr>
+</table>
+{{else}}
+<p class="bad">Not signed.</p>
+{{end}}
+{{end}}
+</section>
+</div>
+</div>
+
+{{if .EntropyMap}}
+<h2>Entropy map</h2>
+<section class="panel">
+  {{entropy .EntropyMap}}
+  <div class="legend"><span>start of file</span><span>overall {{f2 .Entropy}} bits/byte · dashed line = 7.2 (packed / encrypted) · {{bytesi .EntropyBlock}} blocks</span><span>end</span></div>
+</section>
+{{end}}
+
+{{range $i, $s := .Slices}}
+<h2>{{$s.Arch}} {{$s.Kind}}</h2>
+<section class="panel">
+<table>
+  <tr><td class="k">Bits</td><td>{{$s.Bits}}</td></tr>
+  {{if $s.Entry}}<tr><td class="k">Entry point</td><td class="mono">{{hex $s.Entry}}{{if $s.EntrySect}} in {{$s.EntrySect}}{{end}}</td></tr>{{end}}
+  {{range $k, $v := $s.Props}}<tr><td class="k">{{$k}}</td><td>{{$v}}</td></tr>{{end}}
+  <tr><td class="k">Imports / exports</td><td>{{len $s.Imports}} imported symbols · {{$s.ExportCount}} exported</td></tr>
+</table>
+{{with notable $s.Imports}}
+<h3 style="font-size:13px;margin:16px 0 4px">Notable imports</h3>
+<table><tr><th>Function</th><th>Library</th><th>Category</th></tr>
+{{range .}}<tr><td class="mono">{{.Name}}</td><td class="mono">{{.Lib}}</td><td><span class="tag">{{.Category}}</span></td></tr>{{end}}
+</table>
+{{end}}
+{{if $s.Segments}}
+<details {{if lt (len $s.Segments) 8}}open{{end}}><summary>Segments ({{len $s.Segments}})</summary>
+<table><tr><th>Name</th><th>Offset</th><th>Size</th><th>Perms</th><th>Entropy</th></tr>
+{{range $s.Segments}}<tr><td class="mono">{{.Name}}</td><td class="mono">{{hex .Offset}}</td><td>{{bytes64 .Size}}</td><td class="mono">{{.Perms}}</td><td><div class="bar {{entClass .Entropy}}" title="{{f2 .Entropy}}"><i style="width:{{pct .Entropy}}%"></i></div>{{f2 .Entropy}}</td></tr>{{end}}
+</table></details>
+{{end}}
+{{if $s.Sections}}
+<details {{if lt (len $s.Sections) 16}}open{{end}}><summary>Sections ({{len $s.Sections}})</summary>
+<table><tr><th>Name</th><th>Offset</th><th>Size</th><th>Perms</th><th>Entropy</th></tr>
+{{range $s.Sections}}<tr><td class="mono">{{.Name}}</td><td class="mono">{{hex .Offset}}</td><td>{{bytes64 .Size}}</td><td class="mono">{{.Perms}}</td><td><div class="bar {{entClass .Entropy}}" title="{{f2 .Entropy}}"><i style="width:{{pct .Entropy}}%"></i></div>{{f2 .Entropy}}</td></tr>{{end}}
+</table></details>
+{{end}}
+{{if $s.Libraries}}
+<details><summary>Linked libraries ({{len $s.Libraries}})</summary><ul class="plain mono">{{range $s.Libraries}}<li>{{.}}</li>{{end}}</ul></details>
+{{end}}
+{{if $s.Imports}}
+<details><summary>All imports ({{len $s.Imports}})</summary><ul class="plain mono">{{range $s.Imports}}<li>{{.Name}}{{if .Lib}} <small>({{.Lib}})</small>{{end}}</li>{{end}}</ul></details>
+{{end}}
+</section>
+{{end}}
+
+{{if not .Container}}
+<h2>Strings &amp; indicators</h2>
+<section class="panel">
+<p style="margin-top:0">{{.Strings.Total}} printable strings (ASCII + UTF-16) extracted · {{len .RuleHits}} content rule(s) matched.</p>
+{{with .Strings.URLs}}<details open><summary>URLs ({{len .}})</summary><ul class="plain mono">{{range .}}<li>{{.}}</li>{{end}}</ul></details>{{end}}
+{{with .Strings.IPs}}<details><summary>Public IP addresses ({{len .}})</summary><ul class="plain mono">{{range .}}<li>{{.}}</li>{{end}}</ul></details>{{end}}
+{{with .Strings.Onions}}<details open><summary>Tor .onion addresses ({{len .}})</summary><ul class="plain mono">{{range .}}<li>{{.}}</li>{{end}}</ul></details>{{end}}
+{{with .Strings.Crypto}}<details open><summary>Cryptocurrency addresses ({{len .}})</summary><ul class="plain mono">{{range .}}<li>{{.}}</li>{{end}}</ul></details>{{end}}
+{{if not (or .Strings.URLs .Strings.IPs .Strings.Onions .Strings.Crypto)}}<p style="color:var(--muted)">No network or wallet indicators extracted.</p>{{end}}
+</section>
+{{end}}
+
+{{with .Toolchain}}{{if or .Language .Notes}}
+<h2>Toolchain</h2>
+<section class="panel">
+<table>
+  {{if .Language}}<tr><td class="k">Language</td><td>{{.Language}} {{.Version}}</td></tr>{{end}}
+  {{if .Module}}<tr><td class="k">Main module</td><td class="mono">{{.Module}}</td></tr>{{end}}
+  {{range .Notes}}<tr><td class="k">Detected</td><td>{{.}}</td></tr>{{end}}
+</table>
+{{if .Deps}}<details><summary>Dependencies ({{len .Deps}})</summary><ul class="plain mono">{{range .Deps}}<li>{{.}}</li>{{end}}</ul></details>{{end}}
+</section>
+{{end}}{{end}}
+
+<h2>Engine</h2>
+<section class="panel">
+<table><tr><th>Task</th><th>Time</th><th>Status</th></tr>
+{{range .Timings}}<tr><td>{{.Name}}</td><td class="mono">{{ms .Duration}}</td><td>{{if eq .Status "ok"}}<span class="ok">ok</span>{{else}}<span class="bad">{{.Status}}</span> <small>{{.Error}}</small>{{end}}</td></tr>{{end}}
+<tr><td><b>Total (tasks run in parallel)</b></td><td class="mono"><b>{{ms .Elapsed}}</b></td><td></td></tr>
+</table>
+</section>
+
+<footer>Generated by binchk · static analysis only — the file was never executed · {{time .AnalyzedAt}}</footer>
+</main>
+<div id="toast">Copied</div>
+<script>
+document.querySelectorAll('.hash').forEach(function(el){el.addEventListener('click',function(){
+  navigator.clipboard&&navigator.clipboard.writeText(el.textContent.trim()).then(function(){
+    var t=document.getElementById('toast');t.style.opacity=1;setTimeout(function(){t.style.opacity=0},900);});
+});});
+</script>
+</body>
+</html>

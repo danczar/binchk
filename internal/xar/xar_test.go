@@ -5,8 +5,10 @@ import (
 	"compress/zlib"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -211,6 +213,26 @@ func TestTOCBombRejected(t *testing.T) {
 		}, 0),
 		"ratio": writeXar(t, xmlTOC("<xar><toc>"+strings.Repeat("<file><name>a</name></file>", 60000)+"</toc></xar>"), 0),
 		"depth": writeXar(t, xmlTOC("<xar><toc>"+strings.Repeat("<file>", 1000)+strings.Repeat("</file>", 1000)+"</toc></xar>"), 0),
+		// Each child's path copies its parent's, so one long directory name,
+		// or a chain of moderate ones, is amplified per descendant. Random
+		// junk keeps the ratio plausible.
+		"longname": writeXar(t, func(w io.Writer) {
+			io.WriteString(w, "<xar><toc>")
+			writeJunk(w)
+			io.WriteString(w, "<file><name>"+strings.Repeat("A", 3<<20)+"</name>")
+			io.WriteString(w, strings.Repeat("<file><name>a</name></file>", 1600))
+			io.WriteString(w, "</file></toc></xar>")
+		}, 0),
+		"name": writeXar(t, xmlTOC("<xar><toc><file><name>"+strings.Repeat("C", 2000)+"</name></file></toc></xar>"), 0),
+		"paths": writeXar(t, func(w io.Writer) {
+			io.WriteString(w, "<xar><toc>")
+			writeJunk(w)
+			for i := range 30 {
+				fmt.Fprintf(w, "<file><name>%d%s</name>", i, strings.Repeat("B", 1000))
+			}
+			io.WriteString(w, strings.Repeat("<file><name>a</name></file>", 9000))
+			io.WriteString(w, strings.Repeat("</file>", 30)+"</toc></xar>")
+		}, 0),
 	}
 	for name, p := range bombs {
 		if st, _ := os.Stat(p); st.Size() > 256<<10 {
@@ -236,4 +258,11 @@ func TestTOCBombRejected(t *testing.T) {
 			t.Errorf("%s: Open took %v", name, el)
 		}
 	}
+}
+
+// writeJunk writes an element holding 80 KiB of incompressible hex.
+func writeJunk(w io.Writer) {
+	b := make([]byte, 80<<10)
+	rand.NewChaCha8([32]byte{1}).Read(b)
+	io.WriteString(w, "<junk>"+hex.EncodeToString(b)+"</junk>")
 }

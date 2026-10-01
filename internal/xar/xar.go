@@ -52,6 +52,9 @@ const (
 	maxTOCEntries = 10000
 	maxTOCDepth   = 64 // nested elements
 	maxTOCCerts   = 32
+	maxTOCField   = 64 << 10 // text of one kept element (a certificate)
+	maxTOCName    = 1024     // one path component
+	maxTOCPaths   = 4 << 20  // all resolved entry paths together
 )
 
 // Open parses the archive header and table of contents.
@@ -103,6 +106,7 @@ func (a *Archive) parseTOC(r io.Reader) error {
 		entry int    // innermost enclosing file entry, or -1
 		sig   int    // enclosing signature (0 signature, 1 x-signature), or -1
 		rel   string // element path below that file or signature
+		keep  bool   // whether its text is used
 	}
 	var (
 		stack   []frame
@@ -153,10 +157,22 @@ func (a *Archive) parseTOC(r io.Reader) error {
 				case fr.entry >= 0 && fr.rel == "data/encoding":
 					a.Entries[fr.entry].Encoding = attr(tok, "style")
 				}
+				switch fr.rel {
+				case "name", "type", "link", "data/offset", "data/length", "data/size":
+					fr.keep = fr.entry >= 0
+				case "KeyInfo/X509Data/X509Certificate":
+					fr.keep = fr.sig >= 0
+				}
 			}
 			stack = append(stack, fr)
 		case xml.CharData:
-			text.Write(tok)
+			// Only kept text is buffered, and none of it is large.
+			if n := len(stack); n > 0 && stack[n-1].keep {
+				if text.Len()+len(tok) > maxTOCField {
+					return errors.New("element text too long")
+				}
+				text.Write(tok)
+			}
 		case xml.EndElement:
 			n := len(stack)
 			fr := stack[n-1]
@@ -165,6 +181,9 @@ func (a *Archive) parseTOC(r io.Reader) error {
 				var err error
 				switch fr.rel {
 				case "name":
+					if len(s) > maxTOCName {
+						return errors.New("file name too long")
+					}
 					names[fr.entry] = s
 				case "type":
 					e.Type = s
@@ -190,10 +209,15 @@ func (a *Archive) parseTOC(r io.Reader) error {
 		}
 	}
 	// Parents always precede their children, so one pass resolves paths.
+	// Each path repeats its parent's, so bound their total as well.
+	total := 0
 	for i := range a.Entries {
 		dir := ""
 		if parent[i] >= 0 {
 			dir = a.Entries[parent[i]].Path
+		}
+		if total += len(dir) + 1 + len(names[i]); total > maxTOCPaths {
+			return errors.New("entry paths too long")
 		}
 		a.Entries[i].Path = path.Join(dir, names[i])
 	}

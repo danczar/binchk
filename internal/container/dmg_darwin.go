@@ -132,6 +132,9 @@ func (in *inspector) inspectDMG(path string) {
 		default:
 			in.add(analyze.Finding{ID: "dmg-unreadable", Title: "Disk image could not be opened",
 				Severity: analyze.Low, Category: "structure", Evidence: []string{msg}})
+			// Not really an image, perhaps: scan its bytes as a plain file
+			// rather than let a forged trailer hide them.
+			in.analyzeFile(path, filepath.Base(path), "image", fileSize(path))
 		}
 		return
 	}

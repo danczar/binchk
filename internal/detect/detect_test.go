@@ -16,7 +16,16 @@ func TestSniff(t *testing.T) {
 	copy(mzOnly[0x80:], "XX")
 
 	dmg := make([]byte, 4096)
-	copy(dmg[len(dmg)-512:], "koly")
+	copy(dmg[len(dmg)-512:], "koly\x00\x00\x00\x04\x00\x00\x02\x00")
+	bareKoly := make([]byte, 4096)
+	copy(bareKoly[len(bareKoly)-512:], "koly")
+	// Executables with a valid UDIF trailer appended still run: the
+	// leading magic must win.
+	withTrailer := func(b []byte) []byte {
+		out := append(append([]byte{}, b...), make([]byte, 1024)...)
+		copy(out[len(out)-512:], dmg[len(dmg)-512:])
+		return out
+	}
 
 	cases := []struct {
 		name string
@@ -32,6 +41,11 @@ func TestSniff(t *testing.T) {
 		{"text", []byte("#!/bin/sh\necho hi\n"), Unknown},
 		{"empty", nil, Unknown},
 		{"dmg", dmg, DiskImage},
+		{"bare koly signature", bareKoly, Unknown},
+		{"elf+koly", withTrailer([]byte("\x7fELF\x02\x01\x01\x00")), ELF},
+		{"macho+koly", withTrailer([]byte{0xcf, 0xfa, 0xed, 0xfe, 7, 0, 0, 1}), MachO},
+		{"fat+koly", withTrailer([]byte{0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2}), MachOFat},
+		{"pe+koly", withTrailer(pe), PE},
 		{"encrypted dmg", []byte("encrcdsa\x00\x00\x00\x02"), DiskImage},
 		{"pkg", []byte("xar!\x00\x1c\x00\x01"), InstallerPkg},
 	}

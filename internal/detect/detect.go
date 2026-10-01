@@ -59,16 +59,36 @@ func Sniff(r io.ReaderAt, size int64) Format {
 	if n < 4 {
 		return Unknown
 	}
-	be := binary.BigEndian.Uint32(h[:4])
-	// UDIF disk images end with a 512-byte "koly" trailer.
-	if size >= 1024 {
-		var k [4]byte
-		if _, err := r.ReadAt(k[:], size-512); err == nil && string(k[:]) == "koly" {
-			return DiskImage
-		}
+	// Leading magic wins: loaders ignore trailing bytes, so an appended
+	// "koly" trailer must never turn an executable into a disk image.
+	if f := sniffMagic(r, h[:n], size); f != Unknown {
+		return f
 	}
+	if HasUDIFTrailer(r, size) {
+		return DiskImage
+	}
+	return Unknown
+}
+
+// HasUDIFTrailer reports whether the file ends with a UDIF "koly" trailer:
+// signature, version 4 and a 512-byte header size, as hdiutil writes them.
+func HasUDIFTrailer(r io.ReaderAt, size int64) bool {
+	if size < 1024 {
+		return false
+	}
+	var k [12]byte
+	if _, err := r.ReadAt(k[:], size-512); err != nil {
+		return false
+	}
+	return string(k[:4]) == "koly" && binary.BigEndian.Uint32(k[4:8]) == 4 && binary.BigEndian.Uint32(k[8:12]) == 512
+}
+
+// sniffMagic classifies a file by its leading bytes h (at least 4).
+func sniffMagic(r io.ReaderAt, h []byte, size int64) Format {
+	n := len(h)
+	be := binary.BigEndian.Uint32(h[:4])
 	switch {
-	case string(h[:8]) == "encrcdsa":
+	case n >= 8 && string(h[:8]) == "encrcdsa":
 		// Encrypted disk images: the UDIF trailer is inside the ciphertext.
 		return DiskImage
 	case string(h[:4]) == "xar!":

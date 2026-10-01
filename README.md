@@ -111,6 +111,7 @@ cd binchk
 make build        # bin/binchk for this machine
 make app          # macOS: dist/binchk.app (universal, menu-bar only)
 make all          # cross-build darwin / linux / windows × amd64 / arm64
+make release      # macOS: release archives + SHA256SUMS in dist/release
 ```
 
 ## Usage

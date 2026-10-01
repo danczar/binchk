@@ -36,6 +36,12 @@ func ExtractCPIO(ctx context.Context, r io.Reader, dir string, lim Limits) (int6
 		return 0, err
 	}
 	defer root.Close()
+	// No link left behind may resolve outside dir, whatever the outcome.
+	// Links are checked against the real tree as they are created, and
+	// again once it is final, because a later entry can change how an
+	// earlier link resolves.
+	links := &linkGuard{root: root, budget: linkBudget}
+	defer links.prune()
 	r = ctxReader{ctx, r}
 	var written, consumed int64
 	entries := 0
@@ -68,13 +74,13 @@ func ExtractCPIO(ctx context.Context, r io.Reader, dir string, lim Limits) (int6
 			mkdirs(root, rel, dirs)
 		case mode == 0o120000 && h.size < 4096:
 			target, _ := io.ReadAll(body)
-			// Only links that resolve inside the extraction root. The parent
-			// holds no symlinks (mkdirs), so the lexical check is exact.
+			// Only links whose target, resolved through the tree as it
+			// stands (existing links included), stays inside the root.
 			t := string(target)
-			resolved := filepath.Clean(filepath.Join(filepath.Dir(rel), t))
-			if !filepath.IsAbs(t) && resolved != ".." && !strings.HasPrefix(resolved, ".."+string(filepath.Separator)) &&
-				mkdirs(root, filepath.Dir(rel), dirs) {
-				root.Symlink(t, rel)
+			if !isAbsLink(t) && mkdirs(root, filepath.Dir(rel), dirs) &&
+				links.inRoot(append(splitPath(filepath.Dir(rel)), splitPath(t)...)) &&
+				root.Symlink(t, rel) == nil {
+				links.made = append(links.made, rel)
 			}
 		case mode == 0o100000:
 			if !mkdirs(root, filepath.Dir(rel), dirs) {
@@ -115,6 +121,91 @@ func (c ctxReader) Read(p []byte) (int, error) {
 		return 0, err
 	}
 	return c.r.Read(p)
+}
+
+// linkBudget bounds the path components resolved across all of one
+// extraction's symlink checks. Real packages use a small fraction of it;
+// once it is spent every remaining link is refused or removed (fails closed).
+const linkBudget = 1 << 20
+
+// maxLinkHops matches the kernel's MAXSYMLINKS on macOS.
+const maxLinkHops = 32
+
+// linkGuard decides whether symlinks stay inside the extraction root by
+// resolving them against the real tree, component by component, following
+// the links already present the way the kernel would.
+type linkGuard struct {
+	root   *os.Root
+	budget int
+	made   []string // links created, root-relative
+}
+
+// prune removes every created link that, in the final tree, resolves
+// outside the root. inRoot rejects a path whose resolution leaves the root
+// at any step, so removing a link can only make others dangle (a missing
+// component fails resolution), never escape: one pass suffices.
+func (g *linkGuard) prune() {
+	for _, l := range g.made {
+		if !g.inRoot(splitPath(l)) {
+			g.root.Remove(l)
+		}
+	}
+}
+
+// inRoot resolves the root-relative path comps and reports whether every
+// step stays within the root. Components that do not exist are taken
+// lexically. Loops, too many hops and an exhausted budget report false.
+func (g *linkGuard) inRoot(comps []string) bool {
+	var cur []string // resolved components, none of them a link
+	hops := 0
+	for len(comps) > 0 {
+		if g.budget--; g.budget < 0 {
+			return false
+		}
+		c := comps[0]
+		comps = comps[1:]
+		switch c {
+		case "", ".":
+			continue
+		case "..":
+			if len(cur) == 0 {
+				return false
+			}
+			cur = cur[:len(cur)-1]
+			continue
+		}
+		p := filepath.Join(append(cur, c)...)
+		fi, err := g.root.Lstat(p)
+		if err != nil || fi.Mode()&fs.ModeSymlink == 0 {
+			// A file, a directory, or missing: nothing to follow.
+			cur = append(cur, c)
+			continue
+		}
+		if hops++; hops > maxLinkHops {
+			return false
+		}
+		t, err := g.root.Readlink(p)
+		if err != nil || isAbsLink(t) {
+			return false
+		}
+		// The link's target replaces it, relative to its directory (cur).
+		comps = append(splitPath(t), comps...)
+	}
+	return true
+}
+
+// isAbsLink reports a link target not anchored at the link's own
+// directory: empty, absolute, rooted, or carrying a volume name.
+func isAbsLink(t string) bool {
+	return t == "" || t[0] == '/' || os.IsPathSeparator(t[0]) || filepath.IsAbs(t) || filepath.VolumeName(t) != ""
+}
+
+// splitPath splits on "/" and the OS separator without cleaning, so a ".."
+// after a link climbs from the link's target, not lexically.
+func splitPath(p string) []string {
+	return strings.FieldsFunc(p, func(r rune) bool {
+		return r == '/' || r < 0x80 && os.IsPathSeparator(uint8(r))
+	})
 }
 
 // mkdirs creates dir (relative to root) and its parents, reporting false if

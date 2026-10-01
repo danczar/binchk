@@ -10,6 +10,7 @@ import (
 	"compress/bzip2"
 	"compress/gzip"
 	"compress/zlib"
+	"context"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
@@ -178,6 +179,12 @@ func (a *Archive) ReadAll(e Entry, max int64) ([]byte, error) {
 // PayloadReader decodes an installer Payload or Scripts stream, which is a
 // cpio archive either raw, gzip-compressed, or pbzx (chunked xz).
 func PayloadReader(r io.Reader) (io.Reader, error) {
+	return PayloadReaderContext(context.Background(), r)
+}
+
+// PayloadReaderContext is PayloadReader with decoding that stops once ctx
+// is done, even between pbzx chunks that yield no data.
+func PayloadReaderContext(ctx context.Context, r io.Reader) (io.Reader, error) {
 	br := &peekReader{r: r}
 	head, err := br.peek(6)
 	if err != nil && len(head) < 4 {
@@ -187,7 +194,7 @@ func PayloadReader(r io.Reader) (io.Reader, error) {
 	case bytes.HasPrefix(head, []byte{0x1f, 0x8b}):
 		return gzip.NewReader(br)
 	case bytes.HasPrefix(head, []byte("pbzx")):
-		return newPBZX(br)
+		return newPBZX(ctx, br)
 	case bytes.HasPrefix(head, []byte("0707")):
 		return br, nil
 	case bytes.HasPrefix(head, []byte("BZh")):

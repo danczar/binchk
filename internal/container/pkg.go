@@ -202,7 +202,7 @@ func extract(in *inspector, a *xar.Archive, e xar.Entry, dst string, payload boo
 		return 0, err
 	}
 	defer rc.Close()
-	pr, err := xar.PayloadReader(rc)
+	pr, err := xar.PayloadReaderContext(in.ctx, rc)
 	if err != nil {
 		return 0, err
 	}

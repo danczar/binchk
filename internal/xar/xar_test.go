@@ -165,3 +165,97 @@ func TestPkgbuildPackage(t *testing.T) {
 		t.Errorf("postinstall: %q", b)
 	}
 }
+
+// Links whose lexical target stays inside the root but whose real
+// resolution, through earlier links, climbs out of it must not survive.
+func TestExtractCPIOSymlinkResolvedEscape(t *testing.T) {
+	var arc bytes.Buffer
+	arc.Write(odc("./q", 0o120777, []byte(".")))
+	arc.Write(odc("./p", 0o120777, []byte("q/..")))           // really the parent of root
+	arc.Write(odc("./d/r", 0o120777, []byte("../q/../q/.."))) // same, from a subdirectory
+	arc.Write(odc("./w", 0o120777, []byte("q/q/q/..")))       // same, through repeated links
+	// Order-dependent: v is created before u exists.
+	arc.Write(odc("./v", 0o120777, []byte("u/..")))
+	arc.Write(odc("./u", 0o120777, []byte(".")))
+	// A link through a link that points at the root's parent.
+	arc.Write(odc("./up", 0o120777, []byte("u/../..")))
+	// Loop.
+	arc.Write(odc("./l1", 0o120777, []byte("l2")))
+	arc.Write(odc("./l2", 0o120777, []byte("l1")))
+	// Legitimate in-root links.
+	arc.Write(odc("./fw/Versions/A/Fw", 0o100644, []byte("lib")))
+	arc.Write(odc("./fw/Versions/Current", 0o120777, []byte("A")))
+	arc.Write(odc("./fw/Fw", 0o120777, []byte("Versions/Current/Fw")))
+	arc.Write(odc("./fw/Res", 0o120777, []byte("Versions/Current/../A/Fw")))
+	arc.Write(odc("./dangling", 0o120777, []byte("missing/file")))
+	arc.Write(odc("TRAILER!!!", 0, nil))
+	base := t.TempDir()
+	dir := filepath.Join(base, "x")
+	if _, err := ExtractCPIO(context.Background(), &arc, dir, Limits{MaxBytes: 1 << 20}); err != nil {
+		t.Fatal(err)
+	}
+	rootReal, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.Type()&os.ModeSymlink == 0 {
+			return err
+		}
+		r, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			return nil // dangling or looping: cannot be followed anywhere
+		}
+		if rel, err := filepath.Rel(rootReal, r); err != nil || !filepath.IsLocal(rel) && rel != "." {
+			t.Errorf("%s resolves outside the root: %s", p, r)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range []string{"p", "d/r", "w", "v", "up"} {
+		if _, err := os.Lstat(filepath.Join(dir, l)); err == nil {
+			t.Errorf("escaping symlink %s was kept", l)
+		}
+	}
+	for _, l := range []string{"fw/Fw", "fw/Res"} {
+		if b, err := os.ReadFile(filepath.Join(dir, l)); err != nil || string(b) != "lib" {
+			t.Errorf("in-root link %s: %q %v", l, b, err)
+		}
+	}
+	for _, l := range []string{"q", "u", "dangling"} {
+		if _, err := os.Lstat(filepath.Join(dir, l)); err != nil {
+			t.Errorf("harmless link %s was removed: %v", l, err)
+		}
+	}
+}
+
+// zeroStream is an endless run of zero bytes: to pbzx, empty chunks forever.
+type zeroStream struct{}
+
+func (zeroStream) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+// The pbzx chunk loop honours ctx even when no chunk yields data.
+func TestPBZXHonoursContext(t *testing.T) {
+	hdr := append([]byte("pbzx"), make([]byte, 8)...)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	pr, err := PayloadReaderContext(ctx, io.MultiReader(bytes.NewReader(hdr), zeroStream{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := pr.Read(make([]byte, 16)); done <- err }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("err = %v, want deadline exceeded", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("pbzx Read ignored the context")
+	}
+}

@@ -2,6 +2,7 @@ package xar
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -13,6 +14,7 @@ import (
 // (u64 flags, u64 length, data) where each chunk is an xz stream, or raw
 // bytes when it could not be compressed.
 type pbzx struct {
+	ctx context.Context
 	r   io.Reader
 	cur io.Reader
 	eof bool
@@ -20,12 +22,12 @@ type pbzx struct {
 
 const maxChunk = 64 << 20
 
-func newPBZX(r io.Reader) (io.Reader, error) {
+func newPBZX(ctx context.Context, r io.Reader) (io.Reader, error) {
 	var hdr [12]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
 	}
-	return &pbzx{r: r}, nil
+	return &pbzx{ctx: ctx, r: r}, nil
 }
 
 func (p *pbzx) next() error {
@@ -60,6 +62,11 @@ func (p *pbzx) Read(b []byte) (int, error) {
 	for {
 		if p.eof {
 			return 0, io.EOF
+		}
+		// A run of chunks that yield no data never returns to the caller,
+		// so the deadline is checked here.
+		if err := p.ctx.Err(); err != nil {
+			return 0, err
 		}
 		if p.cur != nil {
 			n, err := p.cur.Read(b)

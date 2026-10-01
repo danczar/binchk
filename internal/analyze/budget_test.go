@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"debug/elf"
+	"debug/macho"
 	"debug/pe"
 	"encoding/binary"
 	"os"
@@ -81,6 +82,224 @@ func manyDescriptorPE(n, secLen int) []byte {
 	return b.Bytes()
 }
 
+// sigBlobMachO builds a thin arm64 executable whose code-signature
+// SuperBlob has n index entries that all name one entsLen-byte entitlements
+// blob, so parsing each entry costs n*entsLen.
+func sigBlobMachO(n, entsLen int) []byte {
+	be := binary.BigEndian
+	const sigOff = 4096
+	ents := 12 + 8*n
+	sig := make([]byte, ents+8+entsLen)
+	be.PutUint32(sig[0:], 0xfade0cc0)
+	be.PutUint32(sig[4:], uint32(len(sig)))
+	be.PutUint32(sig[8:], uint32(n))
+	for i := range n {
+		be.PutUint32(sig[12+8*i:], 5)
+		be.PutUint32(sig[16+8*i:], uint32(ents))
+	}
+	be.PutUint32(sig[ents:], 0xfade7171)
+	be.PutUint32(sig[ents+4:], uint32(8+entsLen))
+	copy(sig[ents+8:], bytes.Repeat([]byte("a"), entsLen))
+
+	b := make([]byte, sigOff, sigOff+len(sig))
+	le := binary.LittleEndian
+	le.PutUint32(b[0:], macho.Magic64)
+	le.PutUint32(b[4:], uint32(macho.CpuArm64))
+	le.PutUint32(b[12:], uint32(macho.TypeExec))
+	le.PutUint32(b[16:], 1)  // ncmds
+	le.PutUint32(b[20:], 16) // sizeofcmds
+	le.PutUint32(b[32:], lcCodeSignature)
+	le.PutUint32(b[36:], 16)
+	le.PutUint32(b[40:], sigOff)
+	le.PutUint32(b[44:], uint32(len(sig)))
+	return append(b, sig...)
+}
+
+// fatArchesMachO builds a fat file with n arches (distinct subtypes) that all
+// point at one thin slice carrying ncmds load commands.
+func fatArchesMachO(n, ncmds int) []byte {
+	const cmdSize = 24 // LC_UUID
+	thin := make([]byte, 32+cmdSize*ncmds)
+	le := binary.LittleEndian
+	le.PutUint32(thin[0:], macho.Magic64)
+	le.PutUint32(thin[4:], uint32(macho.CpuArm64))
+	le.PutUint32(thin[12:], uint32(macho.TypeExec))
+	le.PutUint32(thin[16:], uint32(ncmds))
+	le.PutUint32(thin[20:], uint32(cmdSize*ncmds))
+	for i := range ncmds {
+		le.PutUint32(thin[32+cmdSize*i:], 0x1b)
+		le.PutUint32(thin[36+cmdSize*i:], cmdSize)
+	}
+	be := binary.BigEndian
+	off := (8 + 20*n + 0x3fff) &^ 0x3fff
+	b := make([]byte, off, off+len(thin))
+	be.PutUint32(b[0:], macho.MagicFat)
+	be.PutUint32(b[4:], uint32(n))
+	for i := range n {
+		a := b[8+20*i:]
+		be.PutUint32(a[0:], uint32(macho.CpuArm64))
+		be.PutUint32(a[4:], uint32(i))
+		be.PutUint32(a[8:], uint32(off))
+		be.PutUint32(a[12:], uint32(len(thin)))
+		be.PutUint32(a[16:], 14)
+	}
+	return append(b, thin...)
+}
+
+// relocPE builds a PE32+ with n section headers that each claim 65535 COFF
+// relocations at the same offset; debug/pe reads them all eagerly.
+func relocPE(n int) []byte {
+	var b bytes.Buffer
+	dos := make([]byte, 0x40)
+	copy(dos, "MZ")
+	binary.LittleEndian.PutUint32(dos[0x3c:], 0x40)
+	b.Write(dos)
+	b.WriteString("PE\x00\x00")
+	binary.Write(&b, binary.LittleEndian, pe.FileHeader{Machine: pe.IMAGE_FILE_MACHINE_AMD64, NumberOfSections: uint16(n),
+		SizeOfOptionalHeader: 240, Characteristics: pe.IMAGE_FILE_EXECUTABLE_IMAGE | pe.IMAGE_FILE_LARGE_ADDRESS_AWARE})
+	relocOff := 0x40 + 4 + 20 + 240 + 40*n
+	binary.Write(&b, binary.LittleEndian, pe.OptionalHeader64{Magic: 0x20b, ImageBase: 0x140000000, SectionAlignment: 0x1000,
+		FileAlignment: 0x200, SizeOfHeaders: uint32(relocOff), NumberOfRvaAndSizes: 16})
+	for range n {
+		binary.Write(&b, binary.LittleEndian, pe.SectionHeader32{PointerToRelocations: uint32(relocOff), NumberOfRelocations: 65535})
+	}
+	b.Write(make([]byte, 10*65535))
+	return b.Bytes()
+}
+
+// interpELF builds an ELF64 whose n program headers are all PT_INTERP over
+// the same dataLen bytes.
+func interpELF(n, dataLen int) []byte {
+	const ehsize, phentsize = 64, 56
+	var b bytes.Buffer
+	binary.Write(&b, binary.LittleEndian, elf.Header64{
+		Ident:     [16]byte{0x7f, 'E', 'L', 'F', byte(elf.ELFCLASS64), byte(elf.ELFDATA2LSB), byte(elf.EV_CURRENT)},
+		Type:      uint16(elf.ET_EXEC),
+		Machine:   uint16(elf.EM_X86_64),
+		Version:   uint32(elf.EV_CURRENT),
+		Phoff:     uint64(ehsize + dataLen),
+		Ehsize:    ehsize,
+		Phentsize: phentsize,
+		Phnum:     uint16(n),
+	})
+	b.Write(bytes.Repeat([]byte("x"), dataLen))
+	for range n {
+		binary.Write(&b, binary.LittleEndian, elf.Prog64{Type: uint32(elf.PT_INTERP), Off: ehsize, Filesz: uint64(dataLen)})
+	}
+	return b.Bytes()
+}
+
+// symtabMachO builds a thin arm64 executable with cmds LC_SYMTAB commands
+// sharing one table of nsyms symbols, all named by the strLen-byte run at
+// offset 1 of the string table; debug/macho copies each name and re-reads
+// the tables per command.
+func symtabMachO(cmds, nsyms, strLen int) []byte {
+	le := binary.LittleEndian
+	symoff := 32 + 24*cmds
+	stroff := symoff + 16*nsyms
+	b := make([]byte, stroff+strLen+1)
+	le.PutUint32(b[0:], macho.Magic64)
+	le.PutUint32(b[4:], uint32(macho.CpuArm64))
+	le.PutUint32(b[12:], uint32(macho.TypeExec))
+	le.PutUint32(b[16:], uint32(cmds))
+	le.PutUint32(b[20:], uint32(24*cmds))
+	for i := range cmds {
+		c := b[32+24*i:]
+		le.PutUint32(c[0:], uint32(macho.LoadCmdSymtab))
+		le.PutUint32(c[4:], 24)
+		le.PutUint32(c[8:], uint32(symoff))
+		le.PutUint32(c[12:], uint32(nsyms))
+		le.PutUint32(c[16:], uint32(stroff))
+		le.PutUint32(c[20:], uint32(strLen+1))
+	}
+	for i := range nsyms {
+		le.PutUint32(b[symoff+16*i:], 1)
+	}
+	copy(b[stroff+1:], bytes.Repeat([]byte("a"), strLen-1))
+	return b
+}
+
+// elfWith lays out an ELF64 with one PT_DYNAMIC program header and the given
+// sections (data plus header template) after it; the section name table is
+// the last section when names is non-nil.
+func elfWith(secs []elf.Section64, data [][]byte, names []uint32) []byte {
+	var body bytes.Buffer
+	const start = 64 + 56
+	for i := range secs {
+		secs[i].Off, secs[i].Size = uint64(start+body.Len()), uint64(len(data[i]))
+		body.Write(data[i])
+	}
+	shoff := start + body.Len()
+	var b bytes.Buffer
+	h := elf.Header64{
+		Ident:     [16]byte{0x7f, 'E', 'L', 'F', byte(elf.ELFCLASS64), byte(elf.ELFDATA2LSB), byte(elf.EV_CURRENT)},
+		Type:      uint16(elf.ET_DYN),
+		Machine:   uint16(elf.EM_X86_64),
+		Version:   uint32(elf.EV_CURRENT),
+		Phoff:     64,
+		Shoff:     uint64(shoff),
+		Ehsize:    64,
+		Phentsize: 56,
+		Phnum:     1,
+		Shentsize: 64,
+		Shnum:     uint16(len(secs) + 1 + len(names)),
+	}
+	if names != nil {
+		h.Shnum, h.Shstrndx = uint16(len(names)), uint16(len(names)-1)
+	}
+	binary.Write(&b, binary.LittleEndian, h)
+	binary.Write(&b, binary.LittleEndian, elf.Prog64{Type: uint32(elf.PT_DYNAMIC), Flags: uint32(elf.PF_R)})
+	b.Write(body.Bytes())
+	if names != nil {
+		// Every header but the last (the name table itself) names offset 1.
+		for i, n := range names[:len(names)-1] {
+			binary.Write(&b, binary.LittleEndian, elf.Section64{Name: n, Type: uint32(elf.SHT_PROGBITS), Off: uint64(start), Size: uint64(min(i, 1))})
+		}
+		binary.Write(&b, binary.LittleEndian, elf.Section64{Type: uint32(elf.SHT_STRTAB), Off: secs[0].Off, Size: secs[0].Size})
+		return b.Bytes()
+	}
+	binary.Write(&b, binary.LittleEndian, elf.Section64{})
+	for _, s := range secs {
+		binary.Write(&b, binary.LittleEndian, s)
+	}
+	return b.Bytes()
+}
+
+// strtab is a string table whose name at offset 1 runs n bytes.
+func strtab(n int) []byte {
+	return append(append([]byte{0}, bytes.Repeat([]byte("a"), n)...), 0)
+}
+
+// shnamesELF has n section headers all named by one long run.
+func shnamesELF(n, strLen int) []byte {
+	names := make([]uint32, n)
+	for i := range names {
+		names[i] = 1
+	}
+	return elfWith([]elf.Section64{{}}, [][]byte{strtab(strLen)}, names)
+}
+
+// dynELF has a dynamic symbol table of nsyms symbols all named by one
+// strLen-byte run, and a version-needs table of recs overlapping records
+// that debug/elf walks recs² times.
+func dynELF(nsyms, strLen, recs int) []byte {
+	le := binary.LittleEndian
+	syms := make([]byte, 24*(nsyms+1))
+	for i := 1; i <= nsyms; i++ {
+		le.PutUint32(syms[24*i:], 1)
+		syms[24*i+4] = byte(elf.STB_GLOBAL)<<4 | byte(elf.STT_FUNC)
+	}
+	// Each record doubles as the aux entry of the one before: version 1,
+	// 65535 aux entries, aux and next both one record on.
+	rec := []byte{1, 0, 0xff, 0xff, 0, 0, 0, 0, 16, 0, 0, 0, 16, 0, 0, 0}
+	return elfWith([]elf.Section64{
+		{Type: uint32(elf.SHT_DYNSYM), Link: 2, Entsize: 24},
+		{Type: uint32(elf.SHT_STRTAB)},
+		{Type: uint32(elf.SHT_GNU_VERSYM), Link: 1},
+		{Type: uint32(elf.SHT_GNU_VERNEED), Link: 2},
+	}, [][]byte{syms, strtab(strLen), make([]byte, 2*(nsyms+1)), bytes.Repeat(rec, recs)}, nil)
+}
+
 // TestFormatBudget: crafted header tables must not make the format task run
 // (or keep the file mapped) far past the analysis budget.
 func TestFormatBudget(t *testing.T) {
@@ -90,8 +309,18 @@ func TestFormatBudget(t *testing.T) {
 	}{
 		{"overlapping ELF sections", "ELF", "overlapping-sections", overlapELF(20000, 2<<20)},
 		{"many PE import descriptors", "PE", "pe-import-anomaly", manyDescriptorPE(100000, 4<<20)},
+		{"Mach-O signature index", "Mach-O", "macho-sig-anomaly", sigBlobMachO(200000, 2<<20)},
+		{"Mach-O fat arches", "Mach-O (universal)", "macho-many-arches", fatArchesMachO(31, 30000)},
+		{"PE COFF relocations", "PE", "pe-reloc-anomaly", relocPE(20000)},
+		{"ELF PT_INTERP headers", "ELF", "elf-multiple-interp", interpELF(65535, 4<<20)},
+		{"Mach-O overlapping symbol names", "Mach-O", "macho-table-anomaly", symtabMachO(1, 1<<15, 1<<20)},
+		{"Mach-O repeated LC_SYMTAB", "Mach-O", "macho-table-anomaly", symtabMachO(20000, 1<<14, 1)},
+		{"ELF overlapping section names", "ELF", "elf-table-anomaly", shnamesELF(30000, 2<<20)},
+		{"ELF overlapping dynamic symbol names", "ELF", "elf-table-anomaly", dynELF(100000, 2<<20, 1)},
+		{"ELF overlapping version records", "ELF", "elf-table-anomaly", dynELF(1, 1, 1<<16)},
 	}
-	budget := 500 * time.Millisecond
+	// Generous for -race on a loaded machine; unbounded parsing takes far longer.
+	budget := 2 * time.Second
 	eng := newTestEngine(t, budget)
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

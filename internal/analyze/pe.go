@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 )
@@ -34,7 +35,8 @@ const (
 )
 
 func analyzePE(ctx context.Context, data []byte) (*formatResult, error) {
-	f, err := pe.NewFile(bytes.NewReader(data))
+	r, relocs := peHeaderReader(data)
+	f, err := pe.NewFile(r)
 	if err != nil {
 		return nil, err
 	}
@@ -43,6 +45,10 @@ func analyzePE(ctx context.Context, data []byte) (*formatResult, error) {
 	bu := newFmtBudget(ctx, len(data))
 	add := func(id, title, detail string, sev Severity, ev ...string) {
 		res.findings = append(res.findings, Finding{ID: id, Title: title, Detail: detail, Severity: sev, Category: "structure", Evidence: ev})
+	}
+	if 10*relocs > uint64(len(data)) {
+		add("pe-reloc-anomaly", "COFF relocation tables describe more data than the file holds", "Images carry no COFF relocations; tables like these are crafted to stall analysis tools.", Medium,
+			fmt.Sprintf("%d relocations", relocs))
 	}
 
 	sl := Slice{Arch: peMachines[f.Machine], Props: map[string]string{}}
@@ -258,6 +264,35 @@ func analyzePE(ctx context.Context, data []byte) (*formatResult, error) {
 	}
 	res.slices = []Slice{sl}
 	return res, nil
+}
+
+// peHeaderReader returns a reader over data for pe.NewFile with the COFF
+// symbol table and every section's relocation count hidden. debug/pe reads
+// both eagerly, and crafted headers make that sections × relocations (or
+// symbols × string length) work; images use neither and the loader ignores
+// them. The string table, which long section names live in, stays readable.
+// relocs is the total relocation count the section headers claimed.
+func peHeaderReader(data []byte) (r io.ReaderAt, relocs uint64) {
+	le := binary.LittleEndian
+	base := uint64(0)
+	if len(data) >= 0x40 && data[0] == 'M' && data[1] == 'Z' {
+		base = uint64(le.Uint32(data[0x3c:])) + 4
+	}
+	fh := sub(data, base, 20)
+	if len(fh) < 20 {
+		return bytes.NewReader(data), 0
+	}
+	shoff := 20 + uint64(le.Uint16(fh[16:]))
+	hdrs := bytes.Clone(sub(data, base, shoff+40*uint64(le.Uint16(fh[2:]))))
+	if pts, n := le.Uint32(hdrs[8:]), le.Uint32(hdrs[12:]); pts != 0 && n != 0 {
+		le.PutUint32(hdrs[8:], pts+18*n) // where debug/pe looks for the string table
+		le.PutUint32(hdrs[12:], 0)
+	}
+	for sh := hdrs[min(shoff, uint64(len(hdrs))):]; len(sh) >= 40; sh = sh[40:] {
+		relocs += uint64(le.Uint16(sh[32:]))
+		le.PutUint16(sh[32:], 0)
+	}
+	return readerWith(data, []patch{{int64(base), hdrs}}), relocs
 }
 
 // peImports returns the same "name:dll" list as debug/pe's ImportedSymbols,

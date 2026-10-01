@@ -2,11 +2,14 @@ package analyze
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"debug/pe"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -32,15 +35,24 @@ const (
 	scnWrite   = 0x80000000
 )
 
-func analyzePE(data []byte) (*formatResult, error) {
-	f, err := pe.NewFile(bytes.NewReader(data))
+func analyzePE(ctx context.Context, data []byte) (*formatResult, error) {
+	r, relocs, craftedNames := peHeaderReader(data)
+	f, err := pe.NewFile(r)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 	res := &formatResult{}
+	bu := newFmtBudget(ctx, len(data))
 	add := func(id, title, detail string, sev Severity, ev ...string) {
 		res.findings = append(res.findings, Finding{ID: id, Title: title, Detail: detail, Severity: sev, Category: "structure", Evidence: ev})
+	}
+	if 10*relocs > uint64(len(data)) {
+		add("pe-reloc-anomaly", "COFF relocation tables describe more data than the file holds", "Images carry no COFF relocations; tables like these are crafted to stall analysis tools.", Medium,
+			fmt.Sprintf("%d relocations", relocs))
+	}
+	if craftedNames {
+		add("pe-table-anomaly", "Crafted section name table", "Long section names overlap in one long run of the COFF string table; linkers never emit that, and it stalls analysis tools, so those names were not read.", Medium)
 	}
 
 	sl := Slice{Arch: peMachines[f.Machine], Props: map[string]string{}}
@@ -102,12 +114,6 @@ func analyzePE(data []byte) (*formatResult, error) {
 	var lastEnd uint64
 	var entrySect *pe.Section
 	for i, s := range f.Sections {
-		perms := permString(s.Characteristics&scnRead != 0, s.Characteristics&scnWrite != 0, s.Characteristics&scnExecute != 0)
-		sec := Section{Name: s.Name, Offset: uint64(s.Offset), Size: uint64(s.Size), Addr: uint64(s.VirtualAddress), Perms: perms}
-		if raw := sub(data, uint64(s.Offset), uint64(s.Size)); len(raw) > 0 {
-			sec.Entropy = entropyOf(raw)
-		}
-		sl.Sections = append(sl.Sections, sec)
 		if s.Size > 0 && uint64(s.Offset)+uint64(s.Size) > lastEnd {
 			lastEnd = uint64(s.Offset) + uint64(s.Size)
 		}
@@ -115,6 +121,17 @@ func analyzePE(data []byte) (*formatResult, error) {
 		if entry >= s.VirtualAddress && entry < s.VirtualAddress+vsize {
 			entrySect = f.Sections[i]
 		}
+		if i >= maxSections {
+			continue
+		}
+		perms := permString(s.Characteristics&scnRead != 0, s.Characteristics&scnWrite != 0, s.Characteristics&scnExecute != 0)
+		sec := Section{Name: s.Name, Offset: uint64(s.Offset), Size: uint64(s.Size), Addr: uint64(s.VirtualAddress), Perms: perms}
+		if raw := sub(data, uint64(s.Offset), uint64(s.Size)); len(raw) > 0 {
+			if sec.Entropy, err = bu.entropy(raw); err != nil {
+				return nil, err
+			}
+		}
+		sl.Sections = append(sl.Sections, sec)
 		exec := s.Characteristics&(scnExecute|scnCode) != 0
 		if exec && s.Characteristics&scnWrite != 0 {
 			add("pe-wx-section", "Writable and executable section", "Self-modifying or unpacking code needs W+X memory; normal compilers never emit it.", Medium, s.Name)
@@ -142,8 +159,16 @@ func analyzePE(data []byte) (*formatResult, error) {
 		add("entry-outside", "Entry point lies outside every section", "", High, fmt.Sprintf("RVA 0x%x", entry))
 	}
 
+	bu.finish(res, len(f.Sections))
+
 	// Imports
-	syms, _ := f.ImportedSymbols()
+	syms, anomaly, err := peImports(ctx, f, data)
+	if err != nil {
+		return nil, err
+	}
+	if anomaly != "" {
+		add("pe-import-anomaly", "Import table exceeds sane limits", "Only part of the import table was read; tables this large are crafted to stall analysis tools.", Medium, anomaly)
+	}
 	libSeen := map[string]bool{}
 	var imphash strings.Builder
 	for _, s := range syms {
@@ -243,6 +268,174 @@ func analyzePE(data []byte) (*formatResult, error) {
 	}
 	res.slices = []Slice{sl}
 	return res, nil
+}
+
+// peHeaderReader returns a reader over data for pe.NewFile with the COFF
+// symbol table and every section's relocation count hidden. debug/pe reads
+// both eagerly, and crafted headers make that sections × relocations (or
+// symbols × string length) work; images use neither and the loader ignores
+// them. The string table, which long section names live in, stays readable,
+// but debug/pe copies one name per "/N" section header up to the next NUL,
+// so names overlapping one long unterminated run cost sections × length.
+// When they would cost more than nameAllowance, every long name is blanked
+// in the headers instead (craftedNames). relocs is the total relocation
+// count the section headers claimed.
+func peHeaderReader(data []byte) (r io.ReaderAt, relocs uint64, craftedNames bool) {
+	le := binary.LittleEndian
+	base := uint64(0)
+	if len(data) >= 0x40 && data[0] == 'M' && data[1] == 'Z' {
+		base = uint64(le.Uint32(data[0x3c:])) + 4
+	}
+	fh := sub(data, base, 20)
+	if len(fh) < 20 {
+		return bytes.NewReader(data), 0, false
+	}
+	shoff := 20 + uint64(le.Uint16(fh[16:]))
+	hdrs := bytes.Clone(sub(data, base, shoff+40*uint64(le.Uint16(fh[2:]))))
+	pts, n := le.Uint32(hdrs[8:]), le.Uint32(hdrs[12:])
+	stOff := pts + 18*n // where debug/pe looks for the string table (uint32, as there)
+	if pts != 0 && n != 0 {
+		le.PutUint32(hdrs[8:], stOff)
+		le.PutUint32(hdrs[12:], 0)
+	}
+	secs := hdrs[min(shoff, uint64(len(hdrs))):]
+	for sh := secs; len(sh) >= 40; sh = sh[40:] {
+		relocs += uint64(le.Uint16(sh[32:]))
+		le.PutUint16(sh[32:], 0)
+	}
+	ps := []patch{{int64(base), hdrs}}
+	if pts == 0 {
+		return readerWith(data, ps), relocs, false
+	}
+	// The string table as debug/pe will see it, through the patched view.
+	var lb [4]byte
+	view := readerWith(data, ps)
+	if n, _ := view.ReadAt(lb[:], int64(stOff)); n < 4 || le.Uint32(lb[:]) <= 4 {
+		return view, relocs, false
+	}
+	tab := make([]byte, min(uint64(le.Uint32(lb[:])-4), uint64(len(data))))
+	k, _ := view.ReadAt(tab, int64(stOff)+4)
+	tab = tab[:k]
+	longNames := func(yield func(uint64) bool) {
+		for sh := secs; len(sh) >= 40; sh = sh[40:] {
+			if sh[0] != '/' {
+				continue
+			}
+			i, err := strconv.Atoi(cstr(sh[1:8]))
+			if err != nil || uint32(i) < 4 { // debug/pe rejects the file
+				continue
+			}
+			if !yield(uint64(uint32(i) - 4)) {
+				return
+			}
+		}
+	}
+	if left := nameAllowance(len(tab)); !namesFit(tab, longNames, &left) {
+		for sh := secs; len(sh) >= 40; sh = sh[40:] {
+			if sh[0] == '/' {
+				clear(sh[:8])
+			}
+		}
+		craftedNames = true
+	}
+	return readerWith(data, ps), relocs, craftedNames
+}
+
+// peImports returns the same "name:dll" list as debug/pe's ImportedSymbols,
+// which copies the whole import section once per descriptor and so goes
+// quadratic on crafted tables. This walk reads the mapped file in place,
+// bounds names and stops at maxImportDescs / maxImportThunks; anomaly says
+// which limit was hit.
+func peImports(ctx context.Context, f *pe.File, data []byte) (syms []string, anomaly string, err error) {
+	var idd pe.DataDirectory
+	pe64 := false
+	switch oh := f.OptionalHeader.(type) {
+	case *pe.OptionalHeader32:
+		if oh.NumberOfRvaAndSizes <= pe.IMAGE_DIRECTORY_ENTRY_IMPORT {
+			return nil, "", nil
+		}
+		idd = oh.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_IMPORT]
+	case *pe.OptionalHeader64:
+		if oh.NumberOfRvaAndSizes <= pe.IMAGE_DIRECTORY_ENTRY_IMPORT {
+			return nil, "", nil
+		}
+		idd, pe64 = oh.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_IMPORT], true
+	default:
+		return nil, "", nil
+	}
+	var ds *pe.Section
+	for _, s := range f.Sections {
+		if s.Offset != 0 && s.VirtualAddress <= idd.VirtualAddress && idd.VirtualAddress-s.VirtualAddress < s.VirtualSize {
+			ds = s
+			break
+		}
+	}
+	if ds == nil {
+		return nil, "", nil
+	}
+	sec := sub(data, uint64(ds.Offset), uint64(ds.Size))
+	if uint64(len(sec)) < uint64(ds.Size) {
+		return nil, "", nil // debug/pe cannot read a truncated section either
+	}
+	name := func(off uint32) string {
+		if uint64(off) >= uint64(len(sec)) {
+			return ""
+		}
+		b := sec[off:min(uint64(off)+maxImportNameLen, uint64(len(sec)))]
+		if n := bytes.IndexByte(b, 0); n >= 0 {
+			return string(b[:n])
+		}
+		return ""
+	}
+	seek := idd.VirtualAddress - ds.VirtualAddress
+	if seek >= uint32(len(sec)) {
+		return nil, "", nil
+	}
+	thunks := 0
+	for d, n := sec[seek:], 0; len(d) >= 20; d, n = d[20:], n+1 {
+		oft, dllRVA := binary.LittleEndian.Uint32(d[0:]), binary.LittleEndian.Uint32(d[12:])
+		if oft == 0 {
+			break
+		}
+		if n == maxImportDescs {
+			return syms, fmt.Sprintf("more than %d import descriptors", maxImportDescs), nil
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
+		dll := name(dllRVA - ds.VirtualAddress)
+		off := oft - ds.VirtualAddress
+		if off >= uint32(len(sec)) {
+			break
+		}
+		for t := sec[off:]; ; {
+			var va uint64
+			var ordinal bool
+			if pe64 {
+				if len(t) < 8 {
+					break
+				}
+				va, t = binary.LittleEndian.Uint64(t), t[8:]
+				ordinal = va&(1<<63) != 0
+			} else {
+				if len(t) <= 4 {
+					break
+				}
+				va, t = uint64(binary.LittleEndian.Uint32(t)), t[4:]
+				ordinal = va&(1<<31) != 0
+			}
+			if va == 0 {
+				break
+			}
+			if thunks++; thunks > maxImportThunks {
+				return syms, fmt.Sprintf("more than %d imported functions", maxImportThunks), nil
+			}
+			if !ordinal {
+				syms = append(syms, name(uint32(va)-ds.VirtualAddress+2)+":"+dll)
+			}
+		}
+	}
+	return syms, "", nil
 }
 
 func rvaToOffset(f *pe.File, rva uint32) (uint64, bool) {

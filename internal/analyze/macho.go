@@ -2,9 +2,11 @@ package analyze
 
 import (
 	"bytes"
+	"context"
 	"debug/macho"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -43,29 +45,161 @@ var riskyEntitlements = map[string]string{
 
 var platformNames = map[uint32]string{1: "macOS", 2: "iOS", 3: "tvOS", 4: "watchOS", 6: "Mac Catalyst", 7: "iOS Simulator", 11: "visionOS"}
 
-func analyzeMachO(data []byte, fat bool) (*formatResult, error) {
+func analyzeMachO(ctx context.Context, data []byte, fat bool) (*formatResult, error) {
 	res := &formatResult{}
+	bu := newFmtBudget(ctx, len(data))
+	crafted := func() {
+		res.findings = append(res.findings, Finding{ID: "macho-table-anomaly", Title: "Symbol or relocation tables are crafted",
+			Detail:   "Repeated symbol tables, relocations that describe more data than the file holds or symbol names that overlap heavily. Linkers never emit these; they stall analysis tools, so those tables were not read in full.",
+			Severity: Medium, Category: "structure"})
+	}
 	if !fat {
-		f, err := macho.NewFile(bytes.NewReader(data))
+		r, odd := machoHeaderReader(data)
+		if odd {
+			crafted()
+		}
+		f, err := macho.NewFile(r)
 		if err != nil {
 			return nil, err
 		}
 		defer f.Close()
-		machoSlice(f, data, res)
+		if err := machoSlice(bu, f, data, res); err != nil {
+			return nil, err
+		}
+		bu.finish(res, max(len(f.Loads), len(f.Sections)))
 		return res, nil
 	}
-	ff, err := macho.NewFatFile(bytes.NewReader(data))
+	r, narch, odd := fatHeaderReader(data)
+	if odd {
+		crafted()
+	}
+	if narch > maxFatArches {
+		res.findings = append(res.findings, Finding{ID: "macho-many-arches", Title: "Unusually many architectures in a universal binary",
+			Detail:   fmt.Sprintf("Only the first %d were analysed.", maxFatArches),
+			Severity: Low, Category: "structure", Evidence: []string{fmt.Sprintf("%d architectures", narch)}})
+	}
+	ff, err := macho.NewFatFile(r)
 	if err != nil {
 		return nil, err
 	}
 	defer ff.Close()
+	most := 0
 	for _, a := range ff.Arches {
-		machoSlice(a.File, sub(data, uint64(a.Offset), uint64(a.Size)), res)
+		if err := machoSlice(bu, a.File, sub(data, uint64(a.Offset), uint64(a.Size)), res); err != nil {
+			return nil, err
+		}
+		most = max(most, len(a.Loads), len(a.Sections))
 	}
+	bu.finish(res, most)
 	return res, nil
 }
 
-func machoSlice(f *macho.File, data []byte, res *formatResult) {
+// fatHeaderReader returns a reader over a universal binary for
+// macho.NewFatFile that shows at most maxFatArches slices, each patched as
+// machoHeaderReader does, and the slice count the header claimed. debug/macho
+// parses every slice up front, so a header naming many slices (all perhaps
+// the same bytes) multiplies the work.
+func fatHeaderReader(data []byte) (r io.ReaderAt, narch uint32, crafted bool) {
+	if len(data) < 8 {
+		return bytes.NewReader(data), 0, false
+	}
+	be := binary.BigEndian
+	narch = be.Uint32(data[4:])
+	var ps []patch
+	if narch > maxFatArches {
+		ps = append(ps, patch{4, be.AppendUint32(nil, maxFatArches)})
+	}
+	for a := sub(data, 8, 20*uint64(min(narch, maxFatArches))); len(a) >= 20; a = a[20:] {
+		off := uint64(be.Uint32(a[8:]))
+		sp, odd := machoPatches(sub(data, off, uint64(be.Uint32(a[12:]))), int64(off))
+		ps, crafted = append(ps, sp...), crafted || odd
+	}
+	return readerWith(data, ps), narch, crafted
+}
+
+// machoHeaderReader returns a reader over a thin Mach-O for macho.NewFile
+// patched by machoPatches, and whether anything needed patching.
+func machoHeaderReader(data []byte) (io.ReaderAt, bool) {
+	ps, crafted := machoPatches(data, 0)
+	return readerWith(data, ps), crafted
+}
+
+// machoPatches hides from debug/macho the parts of the thin Mach-O s (at
+// base in the file) that it would otherwise turn into unbounded work: every
+// LC_SYMTAB and LC_DYSYMTAB after the first (each one re-reads its tables),
+// section relocations (read eagerly, never used here) and a string table
+// whose names overlap so heavily that decoding them costs symbols × size,
+// which is zeroed. crafted reports anything beyond relocations that fit the
+// file, which object files legitimately carry.
+func machoPatches(s []byte, base int64) (ps []patch, crafted bool) {
+	if len(s) < 28 {
+		return nil, false
+	}
+	var bo binary.ByteOrder = binary.LittleEndian
+	magic := bo.Uint32(s)
+	if magic != macho.Magic32 && magic != macho.Magic64 {
+		bo, magic = binary.BigEndian, binary.BigEndian.Uint32(s)
+		if magic != macho.Magic32 && magic != macho.Magic64 {
+			return nil, false
+		}
+	}
+	hdr, segCmd, segHdr, sectSize, nrelocAt, symSize := uint64(28), uint32(macho.LoadCmdSegment), 56, 68, 52, 12
+	if magic == macho.Magic64 {
+		hdr, segCmd, segHdr, sectSize, nrelocAt, symSize = 32, uint32(macho.LoadCmdSegment64), 72, 80, 60, 16
+	}
+	cmds := sub(s, hdr, uint64(bo.Uint32(s[20:])))
+	var fixed []byte // copy of cmds, made on the first change
+	zero := func(at uint64) {
+		if fixed == nil {
+			fixed = bytes.Clone(cmds)
+		}
+		bo.PutUint32(fixed[at:], 0)
+	}
+	haveSymtab, haveDysymtab := false, false
+	var symtab []byte
+	var relocs uint64
+	for i, at := uint32(0), uint64(0); i < bo.Uint32(s[16:]) && at+8 <= uint64(len(cmds)); i++ {
+		cmd, size := bo.Uint32(cmds[at:]), uint64(bo.Uint32(cmds[at+4:]))
+		if size < 8 || size > uint64(len(cmds))-at {
+			break
+		}
+		switch {
+		case cmd == uint32(macho.LoadCmdSymtab) && !haveSymtab:
+			haveSymtab, symtab = true, cmds[at:at+size]
+		case cmd == uint32(macho.LoadCmdDysymtab) && !haveDysymtab:
+			haveDysymtab = true
+		case cmd == uint32(macho.LoadCmdSymtab), cmd == uint32(macho.LoadCmdDysymtab):
+			zero(at) // an unknown command, kept as raw bytes
+			crafted = true
+		case cmd == segCmd:
+			for sect := at + uint64(segHdr); sect+uint64(sectSize) <= at+size; sect += uint64(sectSize) {
+				if n := bo.Uint32(cmds[sect+uint64(nrelocAt):]); n != 0 {
+					relocs += uint64(n)
+					zero(sect + uint64(nrelocAt))
+				}
+			}
+		}
+		at += size
+	}
+	if 8*relocs > uint64(len(s)) {
+		crafted = true
+	}
+	if fixed != nil {
+		ps = append(ps, patch{base + int64(hdr), fixed})
+	}
+	if len(symtab) >= 24 {
+		syms := sub(s, uint64(bo.Uint32(symtab[8:])), uint64(bo.Uint32(symtab[12:]))*uint64(symSize))
+		stroff := uint64(bo.Uint32(symtab[16:]))
+		tab := sub(s, stroff, uint64(bo.Uint32(symtab[20:])))
+		if left := nameAllowance(len(tab)); !namesFit(tab, nameOffsets(syms, symSize, bo), &left) {
+			ps = append(ps, patch{base + int64(stroff), make([]byte, len(tab))})
+			crafted = true
+		}
+	}
+	return ps, crafted
+}
+
+func machoSlice(bu *fmtBudget, f *macho.File, data []byte, res *formatResult) error {
 	add := func(id, title, detail string, sev Severity, ev ...string) {
 		res.findings = append(res.findings, Finding{ID: id, Title: title, Detail: detail, Severity: sev, Category: "structure", Evidence: ev})
 	}
@@ -97,23 +231,29 @@ func machoSlice(f *macho.File, data []byte, res *formatResult) {
 	var textAddr uint64
 	hasPageZero := false
 	var sig Signature
-	hasSig := false
+	hasSig, seenSig := false, false
 	var dyldEnv []string
 	for _, l := range f.Loads {
 		raw := l.Raw()
 		if seg, ok := l.(*macho.Segment); ok {
-			perms := permString(seg.Prot&1 != 0, seg.Prot&2 != 0, seg.Prot&4 != 0)
-			s := Section{Name: seg.Name, Offset: seg.Offset, Size: seg.Filesz, Addr: seg.Addr, Perms: perms}
-			if seg.Filesz > 0 {
-				s.Entropy = entropyOf(sub(data, seg.Offset, seg.Filesz))
-			}
-			sl.Segments = append(sl.Segments, s)
 			switch seg.Name {
 			case "__TEXT":
 				textAddr = seg.Addr
 			case "__PAGEZERO":
 				hasPageZero = true
 			}
+			if len(sl.Segments) >= maxSections {
+				continue
+			}
+			perms := permString(seg.Prot&1 != 0, seg.Prot&2 != 0, seg.Prot&4 != 0)
+			s := Section{Name: seg.Name, Offset: seg.Offset, Size: seg.Filesz, Addr: seg.Addr, Perms: perms}
+			if seg.Filesz > 0 {
+				var err error
+				if s.Entropy, err = bu.entropy(sub(data, seg.Offset, seg.Filesz)); err != nil {
+					return err
+				}
+			}
+			sl.Segments = append(sl.Segments, s)
 			if seg.Prot&7 == 7 {
 				add("macho-rwx-segment", "Segment is writable and executable", "", Medium, seg.Name)
 			}
@@ -161,11 +301,16 @@ func machoSlice(f *macho.File, data []byte, res *formatResult) {
 				}
 			}
 		case lcCodeSignature:
-			if len(raw) >= 16 {
+			// dyld and the kernel read only the first one.
+			if len(raw) >= 16 && !seenSig {
+				seenSig = true
 				off, n := bo.Uint32(raw[8:]), bo.Uint32(raw[12:])
 				if blob := sub(data, uint64(off), uint64(n)); len(blob) > 0 {
 					hasSig = true
-					ents := parseCodeSignature(blob, &sig)
+					ents, crafted := parseCodeSignature(blob, &sig)
+					if crafted {
+						add("macho-sig-anomaly", "Code signature index is crafted", "The signature holds far more or repeated entries than codesign writes; only the first of each kind was read.", Medium)
+					}
 					for k, why := range riskyEntitlements {
 						if strings.Contains(ents, "<key>"+k+"</key>") {
 							add("macho-entitlement", "Weakening entitlement", why, Low, k)
@@ -195,17 +340,23 @@ func machoSlice(f *macho.File, data []byte, res *formatResult) {
 
 	for _, s := range f.Sections {
 		sec := Section{Name: s.Seg + "," + s.Name, Offset: uint64(s.Offset), Size: s.Size, Addr: s.Addr}
+		if sl.Entry != 0 && s.Addr <= sl.Entry && sl.Entry < s.Addr+s.Size {
+			sl.EntrySect = sec.Name
+		}
+		if len(sl.Sections) >= maxSections {
+			continue
+		}
 		if s.Flags&0xff != 1 && s.Offset != 0 { // skip S_ZEROFILL
-			sec.Entropy = entropyOf(sub(data, uint64(s.Offset), s.Size))
+			var err error
+			if sec.Entropy, err = bu.entropy(sub(data, uint64(s.Offset), s.Size)); err != nil {
+				return err
+			}
 		}
 		exec := s.Flags&0x80000400 != 0 // S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
 		if exec {
 			sec.Perms = "r-x"
 		}
 		sl.Sections = append(sl.Sections, sec)
-		if sl.Entry != 0 && s.Addr <= sl.Entry && sl.Entry < s.Addr+s.Size {
-			sl.EntrySect = sec.Name
-		}
 		if exec && s.Size > 4096 && sec.Entropy > 7.5 {
 			add("packed-code", "Encrypted or compressed code section", "", Medium, fmt.Sprintf("%s: %.2f bits/byte", sec.Name, sec.Entropy))
 		}
@@ -242,6 +393,7 @@ func machoSlice(f *macho.File, data []byte, res *formatResult) {
 		res.sig = sig
 	}
 	res.slices = append(res.slices, sl)
+	return nil
 }
 
 func checkDylibPath(p string, add func(id, title, detail string, sev Severity, ev ...string)) {
@@ -255,17 +407,23 @@ func checkDylibPath(p string, add func(id, title, detail string, sev Severity, e
 }
 
 // parseCodeSignature decodes an Apple code-signature SuperBlob (big-endian)
-// and returns the embedded entitlements plist, if any.
-func parseCodeSignature(b []byte, sig *Signature) (ents string) {
+// and returns the embedded entitlements plist, if any. Only the first
+// maxSigBlobs index entries and the first blob of each kind are decoded, so
+// an index of repeated entries cannot multiply the work; crafted reports
+// that either limit was hit.
+func parseCodeSignature(b []byte, sig *Signature) (ents string, crafted bool) {
 	be := binary.BigEndian
 	sig.Present = true
 	sig.Kind = "Apple code signature"
 	if len(b) < 12 || be.Uint32(b) != 0xfade0cc0 {
 		sig.Flags = append(sig.Flags, "malformed")
-		return ""
+		return "", false
 	}
 	count := be.Uint32(b[8:])
-	cmsSigned := false
+	if count > maxSigBlobs {
+		count, crafted = maxSigBlobs, true
+	}
+	cmsSigned, hasCD, hasEnts := false, false, false
 	for i := uint32(0); i < count && int(12+8*i+8) <= len(b); i++ {
 		typ := be.Uint32(b[12+8*i:])
 		off := be.Uint32(b[16+8*i:])
@@ -279,7 +437,8 @@ func parseCodeSignature(b []byte, sig *Signature) (ents string) {
 		}
 		blob = blob[:n]
 		switch {
-		case magic == 0xfade0c02 && typ == 0 && n >= 44: // primary CodeDirectory
+		case magic == 0xfade0c02 && typ == 0 && n >= 44 && !hasCD: // primary CodeDirectory
+			hasCD = true
 			ver := be.Uint32(blob[8:])
 			flags := be.Uint32(blob[12:])
 			if id := be.Uint32(blob[20:]); int(id) < n {
@@ -301,9 +460,10 @@ func parseCodeSignature(b []byte, sig *Signature) (ents string) {
 					sig.Flags = append(sig.Flags, fl.name)
 				}
 			}
-		case magic == 0xfade7171:
+		case magic == 0xfade7171 && !hasEnts:
+			hasEnts = true
 			ents = string(blob[8:])
-		case magic == 0xfade0b01 && n > 8:
+		case magic == 0xfade0b01 && n > 8 && !cmsSigned:
 			cmsSigned = true
 			fillSigner(sig, blob[8:])
 		}
@@ -311,7 +471,7 @@ func parseCodeSignature(b []byte, sig *Signature) (ents string) {
 	if !cmsSigned {
 		sig.AdHoc = true
 	}
-	return ents
+	return ents, crafted
 }
 
 func machoArch(f *macho.File) string {

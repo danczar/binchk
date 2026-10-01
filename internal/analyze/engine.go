@@ -165,13 +165,16 @@ func (e *Engine) AnalyzeWait(parent context.Context, path string, meta Meta) (*R
 			var err error
 			switch format {
 			case detect.PE:
-				fr, err = analyzePE(data)
+				fr, err = analyzePE(ctx, data)
 			case detect.ELF:
-				fr, err = analyzeELF(data)
+				fr, err = analyzeELF(ctx, data)
 			case detect.MachO, detect.MachOFat:
-				fr, err = analyzeMachO(data, format == detect.MachOFat)
+				fr, err = analyzeMachO(ctx, data, format == detect.MachOFat)
 			default:
 				return nil
+			}
+			if err != nil && ctx.Err() != nil {
+				return err // out of time, not malformed
 			}
 			if err != nil {
 				s.commit(func() {

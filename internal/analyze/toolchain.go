@@ -1,7 +1,6 @@
 package analyze
 
 import (
-	"bytes"
 	"debug/buildinfo"
 	"strings"
 )
@@ -18,7 +17,7 @@ var offensiveGoModules = []string{
 // goToolchain reads Go's embedded build info, which names every module the
 // binary was built from.
 func goToolchain(data []byte) (*Toolchain, []Finding) {
-	bi, err := buildinfo.Read(bytes.NewReader(data))
+	bi, err := buildinfo.Read(parserReader(data))
 	if err != nil {
 		return nil, nil
 	}

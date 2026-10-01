@@ -251,9 +251,9 @@ func (a *App) Handle(path string, detectedAt time.Time) {
 		return
 	}
 	a.sem <- struct{}{}
-	r := container.Analyze(context.Background(), a.eng, entry.StoredPath, analyze.Meta{
+	r := container.AnalyzeWith(context.Background(), a.eng, entry.StoredPath, analyze.Meta{
 		ID: entry.ID, FileName: entry.Name, OriginalPath: path, Provenance: prov, DetectedAt: detectedAt,
-	})
+	}, container.Options{MountImages: a.cfg.InspectInstallers})
 	<-a.sem
 	entry.SHA256, entry.Verdict, entry.Score, entry.Summary = r.Hashes.SHA256, string(r.Verdict), r.Score, r.Summary
 	entry.ReportPath = filepath.Join(a.reportsDir, entry.ID+".html")

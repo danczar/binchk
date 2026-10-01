@@ -76,6 +76,8 @@ func detach(dev string) {
 	}
 }
 
+// inspectDMG mounts and walks the image at path. Callers analyse the image
+// file's own bytes separately (analyzeSelf), mounted or not.
 func (in *inspector) inspectDMG(path string) {
 	// The image file's own Gatekeeper verdict: ~0.2 s, reads no contents,
 	// and tells us whether the vendor signed and notarized the download.

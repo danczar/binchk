@@ -126,10 +126,16 @@ func (e *Engine) AnalyzeWait(parent context.Context, path string, meta Meta) (*R
 	data := mf.Data
 	r.Size = int64(len(data))
 	format := detect.Sniff(byteReaderAt(data), r.Size)
+	// A UDIF polyglot is analysed as its leading side (what runs); the image
+	// side is mounted by the container inspector.
+	poly := detect.UDIFPolyglot(byteReaderAt(data), r.Size)
+	if poly {
+		format = detect.SniffLeading(byteReaderAt(data), r.Size)
+	}
 	r.Format = string(format)
 	if format == detect.Unknown {
 		r.Format = "unknown"
-		if len(data) > 2 && data[0] == '#' && data[1] == '!' {
+		if detect.HasShebang(data[:min(len(data), 5)]) {
 			r.Format = "script"
 		}
 	}
@@ -137,6 +143,18 @@ func (e *Engine) AnalyzeWait(parent context.Context, path string, meta Meta) (*R
 	ctx, cancel := context.WithTimeout(parent, e.opt.Budget)
 	defer cancel()
 	s := &session{r: r, sealed: meta.SkipVerify && meta.Sealed}
+	if poly {
+		lead := r.Format
+		switch r.Format {
+		case "script":
+			lead = "a script"
+		case "unknown":
+			lead = "unrecognised data"
+		}
+		s.findings = append(s.findings, Finding{ID: "udif-trailer", Title: "File that is also a disk image",
+			Detail:   "This file starts as " + lead + " but ends with a disk image trailer, so it both runs (or opens) as that and mounts as an image. Tools that look at only one side miss the other.",
+			Severity: Medium, Category: "defense-evasion"})
+	}
 
 	hashTask := func(name string, h hash.Hash, dst *string) task {
 		return task{name, func(ctx context.Context) error {
@@ -408,8 +426,10 @@ func (e *Engine) correlate(s *session, format detect.Format) {
 		for _, sl := range r.Slices {
 			imports = max(imports, len(sl.Imports))
 		}
+		// Disk images are compressed (or encrypted) by design; their own
+		// bytes are scanned for what could run, not for packing.
 		switch {
-		case installer || hasNote(r.Toolchain.Notes, "PyInstaller") || hasNote(r.Toolchain.Notes, "Nuitka"):
+		case installer || format == detect.DiskImage || hasNote(r.Toolchain.Notes, "PyInstaller") || hasNote(r.Toolchain.Notes, "Nuitka"):
 			sev = Info
 		case imports >= 20:
 			// A real import table means the code itself is not packed;

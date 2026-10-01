@@ -39,17 +39,73 @@ func Supported(f detect.Format) bool {
 	return false
 }
 
+// Options controls what Analyze may open.
+type Options struct {
+	// MountImages allows disk images to be mounted (macOS). When false,
+	// images and UDIF polyglots are analysed as plain files only.
+	MountImages bool
+}
+
 // Analyze dispatches on format: containers are opened and their contents
 // inspected; everything else goes straight to the engine.
 func Analyze(ctx context.Context, eng *analyze.Engine, path string, meta analyze.Meta) *analyze.Report {
-	f := detect.SniffPath(path)
-	if !f.IsContainer() || !Supported(f) {
-		return eng.Analyze(ctx, path, meta)
-	}
-	return analyzeContainer(ctx, eng, path, meta, f)
+	return AnalyzeWith(ctx, eng, path, meta, Options{MountImages: true})
 }
 
-func analyzeContainer(parent context.Context, eng *analyze.Engine, path string, meta analyze.Meta, f detect.Format) *analyze.Report {
+// AnalyzeWith is Analyze with options.
+func AnalyzeWith(ctx context.Context, eng *analyze.Engine, path string, meta analyze.Meta, opt Options) *analyze.Report {
+	f := detect.SniffPath(path)
+	mount := supportsDMG && opt.MountImages
+	if f != detect.AppBundle && polyglot(path) {
+		// Leading bytes and image both count: the file runs (or opens) as
+		// the one and mounts as the other. Without mounting, the engine
+		// analyses the leading side and flags the trailer.
+		if !mount {
+			return eng.Analyze(ctx, path, meta)
+		}
+		return analyzeContainer(ctx, eng, path, meta, f, true)
+	}
+	if !f.IsContainer() || !Supported(f) || (f == detect.DiskImage && !mount) {
+		return eng.Analyze(ctx, path, meta)
+	}
+	return analyzeContainer(ctx, eng, path, meta, f, false)
+}
+
+// polyglot reports whether path carries a UDIF trailer behind some other
+// leading content (an executable, a script, a package header, or any bytes
+// before the image's data fork). Such a file still mounts, so both sides
+// are inspected.
+func polyglot(path string) bool {
+	fh, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer fh.Close()
+	st, err := fh.Stat()
+	return err == nil && st.Mode().IsRegular() && detect.UDIFPolyglot(fh, st.Size())
+}
+
+// leadingFormat names a polyglot's leading side as the engine reports it.
+func leadingFormat(path string) string {
+	fh, err := os.Open(path)
+	if err != nil {
+		return "unknown"
+	}
+	defer fh.Close()
+	st, err := fh.Stat()
+	if err != nil {
+		return "unknown"
+	}
+	if f := detect.SniffLeading(fh, st.Size()); f != detect.Unknown {
+		return string(f)
+	}
+	if hasShebang(path) {
+		return "script"
+	}
+	return "unknown"
+}
+
+func analyzeContainer(parent context.Context, eng *analyze.Engine, path string, meta analyze.Meta, f detect.Format, poly bool) *analyze.Report {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(parent, eng.Budget())
 	defer cancel()
@@ -63,7 +119,13 @@ func analyzeContainer(parent context.Context, eng *analyze.Engine, path string, 
 	if r.OriginalPath == "" {
 		r.OriginalPath = path
 	}
-	in := newInspector(ctx, eng, r, string(f))
+	kind := f
+	if poly {
+		// Reported as its leading side, inspected as that and as an image.
+		r.Format, kind = leadingFormat(path), detect.DiskImage
+	}
+	in := newInspector(ctx, eng, r, string(kind))
+	in.poly = poly
 	// A bundle is a directory: its identity is its main executable's hash
 	// (what the allowlist and blocklist match on).
 	hashTarget := path
@@ -92,12 +154,24 @@ func analyzeContainer(parent context.Context, eng *analyze.Engine, path string, 
 		r.Hashes = h
 		in.mu.Unlock()
 	})
-	switch f {
-	case detect.DiskImage:
+	switch {
+	case poly:
+		// The leading side is the file itself: always analysed in full,
+		// outside the limits on contained files.
+		in.analyzeSelf(path, r.FileName, "leading content")
+		if f == detect.InstallerPkg {
+			in.inspectPkg(path, r.FileName, true)
+		}
 		in.inspectDMG(path)
-	case detect.InstallerPkg:
+	case f == detect.DiskImage:
+		// The image file's own bytes are always analysed too, mounted or
+		// not: a forged trailer may hide a plain file, and a raw image's
+		// leading sectors are the author's to fill with text a shell runs.
+		in.analyzeSelf(path, r.FileName, "image")
+		in.inspectDMG(path)
+	case f == detect.InstallerPkg:
 		in.inspectPkg(path, r.FileName, true)
-	case detect.AppBundle:
+	case f == detect.AppBundle:
 		in.inspectApp(path, r.FileName, true, false)
 	}
 	in.wait()
@@ -122,6 +196,9 @@ type inspector struct {
 	bytes    int64
 	sig      *analyze.Signature // signature of the primary app / package
 	imageSig *analyze.Signature // the disk image's own (notarized) signature
+	// poly marks a UDIF polyglot: no signature found on either side is
+	// credited to it, since neither covers what the other side runs.
+	poly bool
 	// imageChecked closes once the disk image's own assessment is known.
 	imageChecked chan struct{}
 
@@ -204,6 +281,18 @@ func (in *inspector) analyzeIn(abs, rel, kind string, size int64, gate *sealGate
 	in.files++
 	in.bytes += size
 	in.mu.Unlock()
+	in.runFile(abs, rel, kind, gate)
+}
+
+// analyzeSelf analyses the container file itself as a plain file (a
+// polyglot's leading side, an image that will not mount). It is not a
+// contained file, so the per-container limits do not apply.
+func (in *inspector) analyzeSelf(abs, rel, kind string) {
+	in.runFile(abs, rel, kind, nil) // the container itself is never seal-gated
+}
+
+// runFile analyses one file; gate is the enclosing bundle's seal gate, or nil.
+func (in *inspector) runFile(abs, rel, kind string, gate *sealGate) {
 	in.goTask(func() {
 		select {
 		case in.sem <- struct{}{}:
@@ -291,7 +380,7 @@ func lift(rel string, fs []analyze.Finding) []analyze.Finding {
 // imageNotarized waits (briefly) for the disk image assessment and reports
 // whether the image itself is signed and notarized.
 func (in *inspector) imageNotarized() bool {
-	if in.imageChecked == nil {
+	if in.poly || in.imageChecked == nil {
 		return false
 	}
 	select {
@@ -364,8 +453,10 @@ func (in *inspector) finalize(start time.Time) {
 			Severity: analyze.Info, Category: "engine"})
 	}
 	// Prefer the app's verified signature; fall back to the notarized disk
-	// image when the app could not be verified within the budget.
+	// image when the app could not be verified within the budget. A
+	// polyglot earns no trust from either side.
 	switch {
+	case in.poly:
 	case in.sig != nil && in.sig.Verified != nil:
 		r.Signature = *in.sig
 	case in.imageSig != nil:

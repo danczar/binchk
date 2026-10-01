@@ -81,3 +81,37 @@ func TestSniffPathBundle(t *testing.T) {
 		t.Error("empty .app folder recognised as bundle")
 	}
 }
+
+func TestUDIFPolyglot(t *testing.T) {
+	trailer := func(lead []byte, dataOff uint64) []byte {
+		b := make([]byte, 4096)
+		copy(b, lead)
+		k := b[len(b)-512:]
+		copy(k, "koly\x00\x00\x00\x04\x00\x00\x02\x00")
+		binary.BigEndian.PutUint64(k[0x18:], dataOff)
+		return b
+	}
+	cases := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{"plain image", trailer([]byte{0x78, 0xda, 1, 2}, 0), false},
+		{"no trailer", []byte("#!/bin/sh\necho hi\n"), false},
+		{"script", trailer([]byte("#!/bin/sh\n"), 0), true},
+		{"macho", trailer([]byte{0xcf, 0xfa, 0xed, 0xfe, 7, 0, 0, 1}, 0), true},
+		{"xar", trailer([]byte("xar!\x00\x1c\x00\x01"), 0), true},
+		{"encrcdsa", trailer([]byte("encrcdsa\x00\x00\x00\x02"), 0), true},
+		{"bytes before data fork", trailer(nil, 1024), true},
+	}
+	for _, c := range cases {
+		if got := UDIFPolyglot(bytes.NewReader(c.data), int64(len(c.data))); got != c.want {
+			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+	// A script with a trailer still sniffs as an image so it is picked up.
+	s := trailer([]byte("#!/bin/sh\n"), 0)
+	if f := Sniff(bytes.NewReader(s), int64(len(s))); f != DiskImage {
+		t.Errorf("script+koly sniffed as %q", f)
+	}
+}

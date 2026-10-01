@@ -137,7 +137,7 @@ func (in *inspector) inspectDMG(path string, rescan bool) {
 			// Not really an image, perhaps: scan its bytes as a plain file
 			// rather than let a forged trailer hide them.
 			if rescan {
-				in.analyzeFile(path, filepath.Base(path), "image", fileSize(path))
+				in.analyzeSelf(path, filepath.Base(path), "image")
 			}
 		}
 		return

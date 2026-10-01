@@ -64,6 +64,8 @@ func Sniff(r io.ReaderAt, size int64) Format {
 	if f := sniffMagic(r, h[:n], size); f != Unknown {
 		return f
 	}
+	// A script with a trailer is still a DiskImage here (so watchers pick
+	// it up); callers check UDIFPolyglot to inspect its leading side too.
 	if HasUDIFTrailer(r, size) {
 		return DiskImage
 	}
@@ -90,6 +92,41 @@ func HasUDIFTrailer(r io.ReaderAt, size int64) bool {
 		return off <= end && n <= end-off
 	}
 	return inside(0x18) && inside(0xD8) // data fork, XML plist
+}
+
+// SniffLeading classifies a file by its leading bytes alone, ignoring any
+// UDIF trailer. Scripts ("#!") are Unknown here as in Sniff.
+func SniffLeading(r io.ReaderAt, size int64) Format {
+	var h [64]byte
+	n, _ := r.ReadAt(h[:], 0)
+	if n < 4 {
+		return Unknown
+	}
+	return sniffMagic(r, h[:n], size)
+}
+
+// UDIFPolyglot reports whether the file ends with a valid UDIF trailer but
+// starts with something other than the image's own data: executable or
+// container magic, a "#!" script, or any bytes before the data fork. Such a
+// file both mounts and runs (or opens as the other format), so both sides
+// must be inspected. Images hdiutil writes start their data fork at 0 with
+// none of those signatures.
+func UDIFPolyglot(r io.ReaderAt, size int64) bool {
+	if !HasUDIFTrailer(r, size) {
+		return false
+	}
+	var h [2]byte
+	if n, _ := r.ReadAt(h[:], 0); n == 2 && h[0] == '#' && h[1] == '!' {
+		return true
+	}
+	if SniffLeading(r, size) != Unknown {
+		return true
+	}
+	var off [8]byte
+	if _, err := r.ReadAt(off[:], size-512+0x18); err != nil {
+		return true
+	}
+	return binary.BigEndian.Uint64(off[:]) != 0
 }
 
 // sniffMagic classifies a file by its leading bytes h (at least 4).

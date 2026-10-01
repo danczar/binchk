@@ -123,6 +123,12 @@ func (e *Engine) AnalyzeWait(parent context.Context, path string, meta Meta) (*R
 	data := mf.Data
 	r.Size = int64(len(data))
 	format := detect.Sniff(byteReaderAt(data), r.Size)
+	// A UDIF polyglot is analysed as its leading side (what runs); the image
+	// side is mounted by the container inspector.
+	poly := detect.UDIFPolyglot(byteReaderAt(data), r.Size)
+	if poly {
+		format = detect.SniffLeading(byteReaderAt(data), r.Size)
+	}
 	r.Format = string(format)
 	if format == detect.Unknown {
 		r.Format = "unknown"
@@ -134,6 +140,18 @@ func (e *Engine) AnalyzeWait(parent context.Context, path string, meta Meta) (*R
 	ctx, cancel := context.WithTimeout(parent, e.opt.Budget)
 	defer cancel()
 	s := &session{r: r}
+	if poly {
+		lead := r.Format
+		switch r.Format {
+		case "script":
+			lead = "a script"
+		case "unknown":
+			lead = "unrecognised data"
+		}
+		s.findings = append(s.findings, Finding{ID: "udif-trailer", Title: "File that is also a disk image",
+			Detail:   "This file starts as " + lead + " but ends with a disk image trailer, so it both runs (or opens) as that and mounts as an image. Tools that look at only one side miss the other.",
+			Severity: Medium, Category: "defense-evasion"})
+	}
 
 	hashTask := func(name string, h hash.Hash, dst *string) task {
 		return task{name, func(ctx context.Context) error {
@@ -172,13 +190,6 @@ func (e *Engine) AnalyzeWait(parent context.Context, path string, meta Meta) (*R
 				fr, err = analyzeMachO(data, format == detect.MachOFat)
 			default:
 				return nil
-			}
-			if detect.HasUDIFTrailer(byteReaderAt(data), r.Size) {
-				s.commit(func() {
-					s.findings = append(s.findings, Finding{ID: "udif-trailer", Title: "Executable that is also a disk image",
-						Detail:   "This file starts like an executable but ends with a disk image trailer, so it both runs and mounts. Tools that look at only one side miss the other.",
-						Severity: Medium, Category: "defense-evasion"})
-				})
 			}
 			if err != nil {
 				s.commit(func() {

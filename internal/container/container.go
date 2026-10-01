@@ -43,10 +43,27 @@ func Supported(f detect.Format) bool {
 // inspected; everything else goes straight to the engine.
 func Analyze(ctx context.Context, eng *analyze.Engine, path string, meta analyze.Meta) *analyze.Report {
 	f := detect.SniffPath(path)
-	if !f.IsContainer() || !Supported(f) {
+	if (!f.IsContainer() || !Supported(f)) && !polyglot(path, f) {
 		return eng.Analyze(ctx, path, meta)
 	}
 	return analyzeContainer(ctx, eng, path, meta, f)
+}
+
+// polyglot reports whether path is an executable that also carries a UDIF
+// trailer. Leading magic decides the format, but a stub prepended to a real
+// image (with the trailer's offsets shifted) still mounts, so both sides are
+// inspected.
+func polyglot(path string, f detect.Format) bool {
+	if f == detect.Unknown || f.IsContainer() || !supportsDMG {
+		return false
+	}
+	fh, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer fh.Close()
+	st, err := fh.Stat()
+	return err == nil && detect.HasUDIFTrailer(fh, st.Size())
 }
 
 func analyzeContainer(parent context.Context, eng *analyze.Engine, path string, meta analyze.Meta, f detect.Format) *analyze.Report {
@@ -63,7 +80,11 @@ func analyzeContainer(parent context.Context, eng *analyze.Engine, path string, 
 	if r.OriginalPath == "" {
 		r.OriginalPath = path
 	}
-	in := newInspector(ctx, eng, r, string(f))
+	kind := f
+	if !f.IsContainer() {
+		kind = detect.DiskImage // polyglot: reported as the executable, inspected as both
+	}
+	in := newInspector(ctx, eng, r, string(kind))
 	// A bundle is a directory: its identity is its main executable's hash
 	// (what the allowlist and blocklist match on).
 	hashTarget := path
@@ -94,11 +115,14 @@ func analyzeContainer(parent context.Context, eng *analyze.Engine, path string, 
 	})
 	switch f {
 	case detect.DiskImage:
-		in.inspectDMG(path)
+		in.inspectDMG(path, true)
 	case detect.InstallerPkg:
 		in.inspectPkg(path, r.FileName, true)
 	case detect.AppBundle:
 		in.inspectApp(path, r.FileName, true, false)
+	default:
+		in.analyzeFile(path, r.FileName, "executable", r.Size)
+		in.inspectDMG(path, false)
 	}
 	in.wait()
 	in.finalize(start)

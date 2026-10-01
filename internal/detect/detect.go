@@ -70,17 +70,26 @@ func Sniff(r io.ReaderAt, size int64) Format {
 	return Unknown
 }
 
-// HasUDIFTrailer reports whether the file ends with a UDIF "koly" trailer:
-// signature, version 4 and a 512-byte header size, as hdiutil writes them.
+// HasUDIFTrailer reports whether the file ends with a plausible UDIF "koly"
+// trailer: signature, a version, the 512-byte header size, and data fork and
+// XML plist ranges that lie inside the file before the trailer.
 func HasUDIFTrailer(r io.ReaderAt, size int64) bool {
 	if size < 1024 {
 		return false
 	}
-	var k [12]byte
+	var k [512]byte
 	if _, err := r.ReadAt(k[:], size-512); err != nil {
 		return false
 	}
-	return string(k[:4]) == "koly" && binary.BigEndian.Uint32(k[4:8]) == 4 && binary.BigEndian.Uint32(k[8:12]) == 512
+	if string(k[:4]) != "koly" || binary.BigEndian.Uint32(k[4:8]) == 0 || binary.BigEndian.Uint32(k[8:12]) != 512 {
+		return false
+	}
+	end := uint64(size - 512)
+	inside := func(at int) bool {
+		off, n := binary.BigEndian.Uint64(k[at:]), binary.BigEndian.Uint64(k[at+8:])
+		return off <= end && n <= end-off
+	}
+	return inside(0x18) && inside(0xD8) // data fork, XML plist
 }
 
 // sniffMagic classifies a file by its leading bytes h (at least 4).

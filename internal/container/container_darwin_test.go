@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"encoding/binary"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -196,6 +197,73 @@ func TestKolyTrailerEvasion(t *testing.T) {
 	}
 	if _, ok := got["lolbin-download"]; !ok {
 		t.Errorf("unmountable image bytes not scanned: %v", got)
+	}
+}
+
+// TestPrependedUDIFImage: a real image with an executable stub prepended
+// (and its trailer offsets shifted to match) still mounts, so its volume
+// must be inspected as well as the stub.
+func TestPrependedUDIFImage(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "src")
+	os.MkdirAll(src, 0o755)
+	makeApp(t, src, "Installer", evilBinary(t, d))
+	img := filepath.Join(d, "evil.dmg")
+	makeDMG(t, src, img)
+	for _, tc := range []struct {
+		name, format string
+		stub         []byte
+	}{
+		{"macho", "Mach-O", []byte{0xcf, 0xfa, 0xed, 0xfe, 7, 0, 0, 1}},
+		{"elf", "ELF", []byte("\x7fELF\x02\x01\x01\x00")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			poly := filepath.Join(d, "poly-"+tc.name+".dmg")
+			prependToImage(t, img, poly, tc.stub)
+			if out, err := exec.Command("hdiutil", "imageinfo", poly).CombinedOutput(); err != nil {
+				t.Fatalf("polyglot does not open as an image: %v\n%s", err, out)
+			}
+			r := Analyze(context.Background(), engine(t), poly, analyze.Meta{})
+			t.Logf("%s %s score=%d: %s", r.Format, r.Verdict, r.Score, r.Summary)
+			if r.Format != tc.format || r.Container == nil {
+				t.Fatalf("format %q container %v", r.Format, r.Container)
+			}
+			if r.Verdict != analyze.VerdictMalicious {
+				t.Errorf("verdict %s", r.Verdict)
+			}
+			got := ids(r)
+			for _, want := range []string{"udif-trailer", "ransom-note", "stealer-wallets"} {
+				if _, ok := got[want]; !ok {
+					t.Errorf("missing %s: %v", want, got)
+				}
+			}
+			if len(r.Container.Bundles) != 1 {
+				t.Errorf("volume not walked: bundles %+v", r.Container.Bundles)
+			}
+			waitDetached(t, poly)
+		})
+	}
+}
+
+// prependToImage writes stub, padded to a 4 KiB boundary, followed by img
+// to out, shifting the koly trailer's fork offsets so hdiutil still finds
+// the image's data.
+func prependToImage(t *testing.T, img, out string, stub []byte) {
+	t.Helper()
+	b, err := os.ReadFile(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pad := make([]byte, 4096)
+	copy(pad, stub)
+	k := b[len(b)-512:]
+	for _, off := range []int{0x18, 0x28, 0xD8} { // data fork, resource fork, XML plist
+		if v := binary.BigEndian.Uint64(k[off:]); v != 0 || off == 0x18 {
+			binary.BigEndian.PutUint64(k[off:], v+uint64(len(pad)))
+		}
+	}
+	if err := os.WriteFile(out, append(pad, b...), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 

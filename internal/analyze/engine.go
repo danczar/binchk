@@ -173,6 +173,13 @@ func (e *Engine) AnalyzeWait(parent context.Context, path string, meta Meta) (*R
 			default:
 				return nil
 			}
+			if detect.HasUDIFTrailer(byteReaderAt(data), r.Size) {
+				s.commit(func() {
+					s.findings = append(s.findings, Finding{ID: "udif-trailer", Title: "Executable that is also a disk image",
+						Detail:   "This file starts like an executable but ends with a disk image trailer, so it both runs and mounts. Tools that look at only one side miss the other.",
+						Severity: Medium, Category: "defense-evasion"})
+				})
+			}
 			if err != nil {
 				s.commit(func() {
 					s.findings = append(s.findings, Finding{ID: "malformed-header", Title: "Malformed " + r.Format + " headers",
@@ -182,13 +189,6 @@ func (e *Engine) AnalyzeWait(parent context.Context, path string, meta Meta) (*R
 				return err
 			}
 			s.commit(func() { s.format = fr })
-			if detect.HasUDIFTrailer(byteReaderAt(data), r.Size) {
-				s.commit(func() {
-					s.findings = append(s.findings, Finding{ID: "udif-trailer", Title: "Executable disguised as a disk image",
-						Detail:   "A disk image trailer is appended to this executable. It still runs, but tools that trust the trailer treat it as a disk image and skip it.",
-						Severity: Medium, Category: "defense-evasion"})
-				})
-			}
 			return nil
 		}},
 		{"toolchain", func(ctx context.Context) error {

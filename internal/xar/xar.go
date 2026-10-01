@@ -11,16 +11,11 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/binary"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"path"
-	"strconv"
-	"strings"
 )
 
 type Entry struct {
@@ -55,6 +50,8 @@ const (
 	maxTOCField   = 64 << 10 // text of one kept element (a certificate)
 	maxTOCName    = 1024     // one path component
 	maxTOCPaths   = 4 << 20  // all resolved entry paths together
+	maxTOCTag     = 4 << 10  // one start or end tag, attributes included
+	maxTOCTagName = 256      // one element or attribute name
 )
 
 // Open parses the archive header and table of contents.
@@ -95,164 +92,6 @@ func Open(name string) (*Archive, error) {
 		return nil, fmt.Errorf("xar toc: %w", err)
 	}
 	return a, nil
-}
-
-// parseTOC streams the TOC XML token by token, collecting file entries
-// (<toc><file>, nested) and signing certificates (<toc><signature> and
-// <toc><x-signature>) without materialising the document.
-func (a *Archive) parseTOC(r io.Reader) error {
-	type frame struct {
-		name  string
-		entry int    // innermost enclosing file entry, or -1
-		sig   int    // enclosing signature (0 signature, 1 x-signature), or -1
-		rel   string // element path below that file or signature
-		keep  bool   // whether its text is used
-	}
-	var (
-		stack   []frame
-		parent  []int    // per entry: parent entry, or -1
-		names   []string // per entry
-		styles  [2]string
-		certs   [2][]string
-		text    strings.Builder
-		rootEnd bool
-	)
-	d := xml.NewDecoder(r)
-	for !rootEnd {
-		tok, err := d.Token()
-		if err == io.EOF {
-			return io.ErrUnexpectedEOF
-		}
-		if err != nil {
-			return err
-		}
-		switch tok := tok.(type) {
-		case xml.StartElement:
-			if len(stack) >= maxTOCDepth {
-				return errors.New("nested too deeply")
-			}
-			text.Reset()
-			fr := frame{name: tok.Name.Local, entry: -1, sig: -1}
-			if n := len(stack); n > 0 {
-				top := stack[n-1]
-				fr.entry, fr.sig = top.entry, top.sig
-				fr.rel = path.Join(top.rel, fr.name)
-				switch {
-				case fr.name == "file" && (n == 2 && top.name == "toc" || top.entry >= 0 && top.rel == ""):
-					if len(a.Entries) >= maxTOCEntries {
-						return errors.New("too many entries")
-					}
-					a.Entries = append(a.Entries, Entry{})
-					parent = append(parent, top.entry)
-					names = append(names, "")
-					fr.entry, fr.rel = len(a.Entries)-1, ""
-				case n == 2 && top.name == "toc" && (fr.name == "signature" || fr.name == "x-signature"):
-					fr.sig, fr.rel = 0, ""
-					if fr.name == "x-signature" {
-						fr.sig = 1
-					}
-					if styles[fr.sig] == "" {
-						styles[fr.sig] = attr(tok, "style")
-					}
-				case fr.entry >= 0 && fr.rel == "data/encoding":
-					a.Entries[fr.entry].Encoding = attr(tok, "style")
-				}
-				switch fr.rel {
-				case "name", "type", "link", "data/offset", "data/length", "data/size":
-					fr.keep = fr.entry >= 0
-				case "KeyInfo/X509Data/X509Certificate":
-					fr.keep = fr.sig >= 0
-				}
-			}
-			stack = append(stack, fr)
-		case xml.CharData:
-			// Only kept text is buffered, and none of it is large.
-			if n := len(stack); n > 0 && stack[n-1].keep {
-				if text.Len()+len(tok) > maxTOCField {
-					return errors.New("element text too long")
-				}
-				text.Write(tok)
-			}
-		case xml.EndElement:
-			n := len(stack)
-			fr := stack[n-1]
-			if fr.entry >= 0 && fr.rel != "" {
-				e, s := &a.Entries[fr.entry], text.String()
-				var err error
-				switch fr.rel {
-				case "name":
-					if len(s) > maxTOCName {
-						return errors.New("file name too long")
-					}
-					names[fr.entry] = s
-				case "type":
-					e.Type = s
-				case "link":
-					e.Link = s
-				case "data/offset":
-					e.Offset, err = parseInt(s)
-				case "data/length":
-					e.Length, err = parseInt(s)
-				case "data/size":
-					e.Size, err = parseInt(s)
-				}
-				if err != nil {
-					return err
-				}
-			}
-			if fr.sig >= 0 && fr.rel == "KeyInfo/X509Data/X509Certificate" && len(certs[0])+len(certs[1]) < maxTOCCerts {
-				certs[fr.sig] = append(certs[fr.sig], text.String())
-			}
-			text.Reset()
-			stack = stack[:n-1]
-			rootEnd = n == 1
-		}
-	}
-	// Parents always precede their children, so one pass resolves paths.
-	// Each path repeats its parent's, so bound their total as well.
-	total := 0
-	for i := range a.Entries {
-		dir := ""
-		if parent[i] >= 0 {
-			dir = a.Entries[parent[i]].Path
-		}
-		if total += len(dir) + 1 + len(names[i]); total > maxTOCPaths {
-			return errors.New("entry paths too long")
-		}
-		a.Entries[i].Path = path.Join(dir, names[i])
-	}
-	for _, s := range styles {
-		if a.SigStyle == "" {
-			a.SigStyle = s
-		}
-	}
-	for _, c := range append(certs[0], certs[1]...) {
-		der, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(c), ""))
-		if err != nil {
-			continue
-		}
-		if cert, err := x509.ParseCertificate(der); err == nil {
-			a.Certs = append(a.Certs, cert)
-		}
-	}
-	return nil
-}
-
-// parseInt reads an integer element, empty meaning 0 as with xml.Unmarshal.
-func parseInt(s string) (int64, error) {
-	if s = strings.TrimSpace(s); s == "" {
-		return 0, nil
-	}
-	return strconv.ParseInt(s, 10, 64)
-}
-
-func attr(se xml.StartElement, name string) string {
-	for _, a := range se.Attr {
-		if a.Name.Local == name {
-			return a.Value
-		}
-	}
-	return ""
 }
 
 func (a *Archive) Close() error { return a.f.Close() }

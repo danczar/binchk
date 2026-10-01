@@ -19,6 +19,8 @@ const (
 	maxImportNameLen  = 1024
 	maxFatArches      = 8       // Mach-O slices parsed from a universal binary
 	maxSigBlobs       = 64      // code-signature SuperBlob index entries
+	maxLoadCommands   = 2048    // Mach-O load commands per slice (real binaries: a few hundred)
+	maxLoadCmdBytes   = 4 << 20 // Mach-O load command area per slice
 	maxInterpLen      = 4096    // PATH_MAX
 	maxVersionEntries = 1 << 16 // ELF symbol version records and aux entries
 )

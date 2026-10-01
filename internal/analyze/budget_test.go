@@ -425,6 +425,7 @@ func TestFormatBudget(t *testing.T) {
 		{"many PE import descriptors", "PE", "pe-import-anomaly", manyDescriptorPE(100000, 4<<20)},
 		{"Mach-O signature index", "Mach-O", "macho-sig-anomaly", sigBlobMachO(200000, 2<<20)},
 		{"Mach-O fat arches", "Mach-O (universal)", "macho-many-arches", fatArchesMachO(31, 30000)},
+		{"Mach-O load command flood", "Mach-O (universal)", "macho-table-anomaly", fatArchesMachO(31, 1_000_000)},
 		{"PE COFF relocations", "PE", "pe-reloc-anomaly", relocPE(20000)},
 		{"ELF PT_INTERP headers", "ELF", "elf-multiple-interp", interpELF(65535, 4<<20)},
 		{"Mach-O overlapping symbol names", "Mach-O", "macho-table-anomaly", symtabMachO(1, 1<<15, 1<<20)},

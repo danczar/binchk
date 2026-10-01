@@ -50,7 +50,7 @@ func analyzeMachO(ctx context.Context, data []byte, fat bool) (*formatResult, er
 	bu := newFmtBudget(ctx, len(data))
 	crafted := func() {
 		res.findings = append(res.findings, Finding{ID: "macho-table-anomaly", Title: "Symbol or relocation tables are crafted",
-			Detail:   "Repeated symbol tables, relocations that describe more data than the file holds or symbol names that overlap heavily. Linkers never emit these; they stall analysis tools, so those tables were not read in full.",
+			Detail:   "Repeated symbol tables, a flood of load commands, relocations that describe more data than the file holds or symbol names that overlap heavily. Linkers never emit these; they stall analysis tools, so those tables were not read in full.",
 			Severity: Medium, Category: "structure"})
 	}
 	if !fat {
@@ -158,10 +158,18 @@ func machoPatches(s []byte, base int64) (ps []patch, crafted bool) {
 	haveSymtab, haveDysymtab := false, false
 	var symtab []byte
 	var relocs uint64
-	for i, at := uint32(0), uint64(0); i < bo.Uint32(s[16:]) && at+8 <= uint64(len(cmds)); i++ {
+	// debug/macho allocates per load command and reads the whole command
+	// area once per slice, so both are capped: keepN commands ending at
+	// keepEnd are what fits in maxLoadCommands / maxLoadCmdBytes.
+	ncmds, cmdBytes := bo.Uint32(s[16:]), uint64(bo.Uint32(s[20:]))
+	keepN, keepEnd := uint32(0), uint64(0)
+	for i, at := uint32(0), uint64(0); i < ncmds && at+8 <= uint64(len(cmds)); i++ {
 		cmd, size := bo.Uint32(cmds[at:]), uint64(bo.Uint32(cmds[at+4:]))
 		if size < 8 || size > uint64(len(cmds))-at {
 			break
+		}
+		if i < maxLoadCommands && at+size <= maxLoadCmdBytes {
+			keepN, keepEnd = i+1, at+size
 		}
 		switch {
 		case cmd == uint32(macho.LoadCmdSymtab) && !haveSymtab:
@@ -182,6 +190,13 @@ func machoPatches(s []byte, base int64) (ps []patch, crafted bool) {
 		at += size
 	}
 	if 8*relocs > uint64(len(s)) {
+		crafted = true
+	}
+	if ncmds > maxLoadCommands || cmdBytes > maxLoadCmdBytes {
+		hdrFix := make([]byte, 8)
+		bo.PutUint32(hdrFix, keepN)
+		bo.PutUint32(hdrFix[4:], uint32(keepEnd))
+		ps = append(ps, patch{base + 16, hdrFix})
 		crafted = true
 	}
 	if fixed != nil {

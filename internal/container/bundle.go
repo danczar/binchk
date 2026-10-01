@@ -82,7 +82,12 @@ func (in *inspector) inspectApp(abs, rel string, assess, partial bool) {
 		sealOK   *bool
 		sealMsg  string
 		unsigned bool
+		covered  bool // sealed by a notarized disk image instead
+		gate     *sealGate
 	)
+	if !partial {
+		gate = &sealGate{}
+	}
 	in.goTask(func() {
 		t0 := time.Now()
 		m, err := codesignInfo(in.ctx, abs)
@@ -129,6 +134,9 @@ func (in *inspector) inspectApp(abs, rel string, assess, partial bool) {
 	} else {
 		in.goTask(func() {
 			if coveredByImage() {
+				sigMu.Lock()
+				covered = true
+				sigMu.Unlock()
 				return
 			}
 			t0 := time.Now()
@@ -181,7 +189,7 @@ func (in *inspector) inspectApp(abs, rel string, assess, partial bool) {
 	}
 	in.goTask(func() {
 		t0 := time.Now()
-		in.bundleCode(abs, rel, mainPath, func(c cand) { in.analyzeIn(c.abs, c.rel, c.kind, c.size, !partial) })
+		in.bundleCode(abs, rel, mainPath, func(c cand) { in.analyzeIn(c.abs, c.rel, c.kind, c.size, gate) })
 		in.timed("scan bundle "+rel, t0, in.ctx.Err())
 	})
 
@@ -232,7 +240,28 @@ func (in *inspector) inspectApp(abs, rel string, assess, partial bool) {
 			in.sig = &s
 		}
 		in.mu.Unlock()
+		if gate != nil {
+			in.resolve(gate, sealTrusted(sealOK, unsigned, covered, sig))
+		}
 	})
+}
+
+// sealTrusted reports whether an app bundle's verification vouches for the
+// signatures of the files inside it: either a notarized disk image covers
+// it, or codesign --deep verified the seal (which checks nested code too)
+// and the bundle is signed by an identified developer whom Gatekeeper did
+// not reject. A check that errored, timed out or was skipped earns nothing.
+func sealTrusted(sealOK *bool, unsigned, covered bool, sig analyze.Signature) bool {
+	if covered {
+		return true
+	}
+	if sealOK == nil || !*sealOK || unsigned {
+		return false
+	}
+	if sig.AdHoc || sig.Signer == "" {
+		return false
+	}
+	return !strings.HasPrefix(sig.Gatekeeper, "rejected")
 }
 
 type cand struct {

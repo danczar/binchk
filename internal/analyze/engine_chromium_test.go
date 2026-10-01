@@ -58,23 +58,27 @@ func TestBrowserEngineGate(t *testing.T) {
 		markers int
 		sealed  bool
 		fs      []Finding
-		want    bool
+		want    engineTrust
 	}{
-		{"verified signer", engine(nil), 3, false, nil, true},
-		{"one marker", engine(nil), 1, false, nil, false},
-		{"script", engine(func(r *Report) { r.Format = "script" }), 3, false, nil, false},
-		{"unsigned standalone", engine(func(r *Report) { r.Signature = Signature{} }), 3, false, nil, false},
-		{"ad-hoc", engine(func(r *Report) { r.Signature.AdHoc = true }), 3, false, nil, false},
-		{"signature fails", engine(func(r *Report) { r.Signature.Verified = &no }), 3, false, nil, false},
-		{"unverified standalone", engine(func(r *Report) { r.Signature.Verified = nil }), 3, false, nil, false},
-		{"sealed bundle", engine(func(r *Report) { r.Signature.Verified = nil }), 3, true, nil, true},
-		{"sealed bundle, few exports", engine(func(r *Report) { r.Signature.Verified = nil; r.Slices[0].ExportCount = 3 }), 3, true, nil, false},
-		{"sealed bundle, no team", engine(func(r *Report) { r.Signature.Verified = nil; r.Signature.TeamID = "" }), 3, true, nil, false},
-		{"sealed bundle, unsigned", engine(func(r *Report) { r.Signature = Signature{} }), 3, true, nil, false},
-		{"wallets", engine(nil), 3, false, []Finding{{ID: "stealer-wallets", Severity: High}}, false},
-		{"webhook", engine(nil), 3, false, []Finding{{ID: "exfil-webhooks", Severity: Medium}}, false},
-		{"keychain escalated", engine(nil), 3, false, []Finding{{ID: "keychain-theft", Severity: High}}, false},
-		{"keychain single", engine(nil), 3, false, []Finding{{ID: "keychain-theft", Severity: Low}}, true},
+		{"verified signer", engine(nil), 3, false, nil, engineTrusted},
+		{"one marker", engine(nil), 1, false, nil, engineNone},
+		{"script", engine(func(r *Report) { r.Format = "script" }), 3, false, nil, engineNone},
+		{"unsigned standalone", engine(func(r *Report) { r.Signature = Signature{} }), 3, false, nil, engineNone},
+		{"ad-hoc", engine(func(r *Report) { r.Signature.AdHoc = true }), 3, false, nil, engineNone},
+		{"signature fails", engine(func(r *Report) { r.Signature.Verified = &no }), 3, false, nil, engineNone},
+		{"unverified standalone", engine(func(r *Report) { r.Signature.Verified = nil }), 3, false, nil, engineNone},
+		{"sealed bundle: pending, not trusted", engine(func(r *Report) { r.Signature.Verified = nil }), 3, true, nil, enginePending},
+		{"sealed bundle, few exports", engine(func(r *Report) { r.Signature.Verified = nil; r.Slices[0].ExportCount = 3 }), 3, true, nil, engineNone},
+		{"sealed bundle, no team", engine(func(r *Report) { r.Signature.Verified = nil; r.Signature.TeamID = "" }), 3, true, nil, engineNone},
+		{"sealed bundle, unsigned", engine(func(r *Report) { r.Signature = Signature{} }), 3, true, nil, engineNone},
+		{"wallets", engine(nil), 3, false, []Finding{{ID: "stealer-wallets", Severity: High}}, engineNone},
+		{"webhook", engine(nil), 3, false, []Finding{{ID: "exfil-webhooks", Severity: Medium}}, engineNone},
+		{"keychain escalated", engine(nil), 3, false, []Finding{{ID: "keychain-theft", Severity: High}}, engineNone},
+		{"keychain single", engine(nil), 3, false, []Finding{{ID: "keychain-theft", Severity: Low}}, engineTrusted},
+		{"sealed bundle, verified signer", engine(nil), 3, true, nil, engineTrusted},
+		{"sealed bundle, signature fails", engine(func(r *Report) { r.Signature.Verified = &no }), 3, true, nil, engineNone},
+		{"sealed bundle, ad-hoc", engine(func(r *Report) { r.Signature.Verified = nil; r.Signature.AdHoc = true }), 3, true, nil, engineNone},
+		{"sealed bundle, wallets", engine(func(r *Report) { r.Signature.Verified = nil }), 3, true, []Finding{{ID: "stealer-wallets", Severity: High}}, engineNone},
 	}
 	for _, c := range cases {
 		if got := browserEngine(c.r, c.markers, c.sealed, c.fs); got != c.want {
@@ -83,9 +87,48 @@ func TestBrowserEngineGate(t *testing.T) {
 	}
 }
 
+// A pending engine report keeps its findings until a container confirms
+// the enclosing seal; confirmation demotes only the inherent findings and
+// rescores, and is a no-op for reports that are not pending.
+func TestConfirmBrowserEngine(t *testing.T) {
+	eng := newTestEngine(t, time.Second)
+	mk := func(pending bool) *Report {
+		r := &Report{Format: "Mach-O", EnginePending: pending, Findings: []Finding{
+			{ID: "stealer-cred-files", Severity: High},
+			{ID: "api-keylogging", Severity: Medium},
+			{ID: "api-priv-exec-mac", Severity: Medium},
+			{ID: "ioc-ip-url", Severity: Medium},
+		}}
+		eng.Finalize(r)
+		return r
+	}
+	r := mk(true)
+	before := r.Score
+	if findingIDs(r)["stealer-cred-files"] != High {
+		t.Fatalf("pending report already demoted: %+v", r.Findings)
+	}
+	eng.ConfirmBrowserEngine(r)
+	got := findingIDs(r)
+	for _, id := range []string{"stealer-cred-files", "api-keylogging", "api-priv-exec-mac"} {
+		if got[id] != Info {
+			t.Errorf("confirmed: %s = %v, want info", id, got[id])
+		}
+	}
+	if got["ioc-ip-url"] != Medium || r.EnginePending || r.Score >= before {
+		t.Errorf("confirmed: ioc %v pending %v score %d (was %d)", got["ioc-ip-url"], r.EnginePending, r.Score, before)
+	}
+	r = mk(false)
+	eng.ConfirmBrowserEngine(r)
+	if findingIDs(r)["stealer-cred-files"] != High {
+		t.Error("ConfirmBrowserEngine demoted a report that was not pending")
+	}
+}
+
 // A file loose in a disk image or package has its signature parsed but
 // never checked (the signer and team ID are forgeable), so only a file in a
-// sealed app bundle may borrow the engine exemption. Uses a real Electron
+// sealed app bundle may borrow the engine exemption, and only once the
+// container has confirmed the seal. TestBrowserEngineGate and
+// TestConfirmBrowserEngine cover the same logic hermetically. Uses a real Electron
 // framework when one is installed: its genuine signature stands in for a
 // transplanted one.
 func TestLooseEngineInContainerNotDemoted(t *testing.T) {
@@ -116,9 +159,21 @@ func TestLooseEngineInContainerNotDemoted(t *testing.T) {
 			t.Errorf("loose in container: %s demoted to info", id)
 		}
 	}
-	for id, sev := range inherent(eng.Analyze(context.Background(), m[0], Meta{SkipVerify: true, Sealed: true})) {
+	// In an app bundle the parsed signature earns nothing on its own: the
+	// report is only marked pending until the container confirms the seal.
+	r := eng.Analyze(context.Background(), m[0], Meta{SkipVerify: true, Sealed: true})
+	if !r.EnginePending {
+		t.Errorf("in sealed bundle: not marked pending")
+	}
+	for id, sev := range inherent(r) {
+		if sev == Info {
+			t.Errorf("in sealed bundle, unconfirmed: %s demoted to info", id)
+		}
+	}
+	eng.ConfirmBrowserEngine(r)
+	for id, sev := range inherent(r) {
 		if sev != Info {
-			t.Errorf("in sealed bundle: %s = %v, want info", id, sev)
+			t.Errorf("in sealed bundle, confirmed: %s = %v, want info", id, sev)
 		}
 	}
 }

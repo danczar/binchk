@@ -217,3 +217,59 @@ func TestStandaloneApp(t *testing.T) {
 		t.Errorf("hash %q size %d", r.Hashes.SHA256, r.Size)
 	}
 }
+
+// TestAdHocAppEngineNotDemoted: a genuine, vendor-signed Electron framework
+// inside an app whose own seal carries no developer identity (ad-hoc, like
+// most Mac malware) must not earn the browser-engine demotion, because the
+// bundle verification vouches for no one. Skips without an Electron app;
+// TestSealTrusted and TestSealGateResolve cover the gate hermetically.
+func TestAdHocAppEngineNotDemoted(t *testing.T) {
+	if testing.Short() {
+		t.Skip("copies and reads a large framework")
+	}
+	fw, _ := filepath.Glob("/Applications/*.app/Contents/Frameworks/Electron Framework.framework")
+	if len(fw) == 0 {
+		t.Skip("no Electron app installed")
+	}
+	d := t.TempDir()
+	main := filepath.Join(d, "main")
+	cmd := exec.Command("go", "build", "-o", main, "./benign")
+	cmd.Dir = "../analyze/testdata"
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	src := filepath.Join(d, "src")
+	os.MkdirAll(filepath.Join(src, "Helper.app/Contents/Frameworks"), 0o755)
+	dst := filepath.Join(src, "Helper.app/Contents/Frameworks", filepath.Base(fw[0]))
+	if exec.Command("cp", "-cR", fw[0], dst).Run() != nil { // clone when possible
+		os.RemoveAll(dst)
+		run(t, "cp", "-R", fw[0], dst)
+	}
+	app := makeApp(t, src, "Helper", main) // ad-hoc signs the outer bundle
+
+	eng, err := analyze.NewEngine(analyze.Options{Budget: 2 * time.Minute, VerifySignatures: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := Analyze(context.Background(), eng, app, analyze.Meta{})
+	t.Logf("%s score=%d in %s: %s", r.Verdict, r.Score, r.Elapsed, r.Summary)
+	found := false
+	for _, f := range r.Container.Files {
+		if !strings.HasSuffix(f.Path, "/Electron Framework") {
+			continue
+		}
+		for _, x := range f.Findings {
+			switch x.ID {
+			case "stealer-cred-files", "api-keylogging", "api-priv-exec-mac":
+				found = true
+				if x.Severity == analyze.Info {
+					t.Errorf("%s demoted to info inside an ad-hoc app", x.ID)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("framework not analysed or has no engine findings: %+v", r.Container.Files)
+	}
+}

@@ -175,12 +175,26 @@ func (in *inspector) goTask(fn func()) {
 // analyzeFile queues one contained file for full engine analysis. rel is
 // the display path inside the container.
 func (in *inspector) analyzeFile(abs, rel, kind string, size int64) {
-	in.analyzeIn(abs, rel, kind, size, false)
+	in.analyzeIn(abs, rel, kind, size, nil)
 }
 
-// analyzeIn is analyzeFile for a file whose enclosing app bundle has its
-// seal checked (sealed), which then vouches for the file's signature.
-func (in *inspector) analyzeIn(abs, rel, kind string, size int64, sealed bool) {
+// sealGate collects the files of one app bundle whose browser-engine
+// demotion depends on that bundle's seal; inspectApp resolves them once the
+// seal and Gatekeeper verdicts are known.
+type sealGate struct {
+	pending []pendingFile // guarded by inspector.mu
+}
+
+type pendingFile struct {
+	cr        *analyze.Report
+	rel, kind string
+}
+
+// analyzeIn is analyzeFile for a file inside an app bundle whose seal is
+// checked (gate non-nil). A report the engine marks EnginePending is held
+// back until the gate is resolved, so it is never recorded with a demotion
+// the seal has not earned.
+func (in *inspector) analyzeIn(abs, rel, kind string, size int64, gate *sealGate) {
 	in.mu.Lock()
 	if in.files >= maxFiles || in.bytes+size > maxBytes {
 		in.c.Skipped++
@@ -199,24 +213,53 @@ func (in *inspector) analyzeIn(abs, rel, kind string, size int64, sealed bool) {
 			in.mu.Unlock()
 			return
 		}
-		cr, released := in.eng.AnalyzeWait(in.ctx, abs, analyze.Meta{FileName: filepath.Base(rel), OriginalPath: rel, SkipVerify: true, Sealed: sealed})
+		cr, released := in.eng.AnalyzeWait(in.ctx, abs, analyze.Meta{FileName: filepath.Base(rel), OriginalPath: rel, SkipVerify: true, Sealed: gate != nil})
 		<-in.sem
-		cf := analyze.ContainedFile{
-			Path: rel, Kind: kind, Format: cr.Format, Arches: cr.Arches, Size: cr.Size, SHA256: cr.Hashes.SHA256,
-			Verdict: cr.Verdict, Score: cr.Score, Summary: cr.Summary, Signer: cr.Signature.Signer,
-			Findings: cr.Findings, Elapsed: cr.Elapsed, Truncated: cr.Truncated,
-		}
-		lifted := lift(rel, cr.Findings)
 		if note, ok := in.eng.Blocklisted(cr.Hashes.SHA256); ok {
 			in.add(analyze.Finding{ID: "hash-blocklist", Title: "Contains a blocklisted file",
 				Severity: analyze.Critical, Category: "reputation", Evidence: []string{rel + ": " + note}})
 		}
 		in.mu.Lock()
-		in.c.Files = append(in.c.Files, cf)
 		in.released = append(in.released, released)
-		in.lifted = append(in.lifted, lifted...)
+		if gate != nil && cr.EnginePending {
+			gate.pending = append(gate.pending, pendingFile{cr, rel, kind})
+			in.mu.Unlock()
+			return
+		}
 		in.mu.Unlock()
+		in.record(cr, rel, kind)
 	})
+}
+
+// resolve records the gate's held-back files, applying the browser-engine
+// demotion only when the bundle was verified (trusted).
+func (in *inspector) resolve(g *sealGate, trusted bool) {
+	in.mu.Lock()
+	pending := g.pending
+	g.pending = nil
+	in.mu.Unlock()
+	for _, p := range pending {
+		if trusted {
+			in.eng.ConfirmBrowserEngine(p.cr)
+		} else {
+			p.cr.EnginePending = false // keeps every finding as analysed
+		}
+		in.record(p.cr, p.rel, p.kind)
+	}
+}
+
+// record adds one analysed file to the container report.
+func (in *inspector) record(cr *analyze.Report, rel, kind string) {
+	cf := analyze.ContainedFile{
+		Path: rel, Kind: kind, Format: cr.Format, Arches: cr.Arches, Size: cr.Size, SHA256: cr.Hashes.SHA256,
+		Verdict: cr.Verdict, Score: cr.Score, Summary: cr.Summary, Signer: cr.Signature.Signer,
+		Findings: cr.Findings, Elapsed: cr.Elapsed, Truncated: cr.Truncated,
+	}
+	lifted := lift(rel, cr.Findings)
+	in.mu.Lock()
+	in.c.Files = append(in.c.Files, cf)
+	in.lifted = append(in.lifted, lifted...)
+	in.mu.Unlock()
 }
 
 // lift re-labels a contained file's findings for the container report so

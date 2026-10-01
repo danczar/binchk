@@ -515,7 +515,7 @@ func TestTOCBombRejected(t *testing.T) {
 		"entries": writeXar(t, func(w io.Writer) {
 			io.WriteString(w, "<xar><toc>")
 			for i := range 20000 {
-				fmt.Fprintf(w, "<file><name>%x</name></file>", i*2654435761)
+				fmt.Fprintf(w, "<file><name>%x</name></file>", uint32(i)*2654435761)
 			}
 			io.WriteString(w, "</toc></xar>")
 		}, 0),

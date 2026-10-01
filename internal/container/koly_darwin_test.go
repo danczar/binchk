@@ -274,3 +274,25 @@ func TestNestedForgedTrailer(t *testing.T) {
 	}
 	waitDetached(t, img)
 }
+
+// TestNestedForgedTrailerGatekeeperBypass: a quarantine-stripping script
+// with a forged trailer must still raise the "fix damaged app" finding.
+func TestNestedForgedTrailerGatekeeperBypass(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "src")
+	os.MkdirAll(src, 0o755)
+	trailer := make([]byte, 512)
+	copy(trailer, "koly\x00\x00\x00\x04\x00\x00\x02\x00")
+	script := []byte("#!/bin/bash\nxattr -d com.apple.quarantine /Applications/Installer.app\n")
+	os.WriteFile(filepath.Join(src, "Install.command"), append(append(script, make([]byte, 1024)...), trailer...), 0o755)
+	img := filepath.Join(d, "bypass.dmg")
+	makeDMG(t, src, img)
+	r := Analyze(context.Background(), engine(t), img, analyze.Meta{})
+	if sev, ok := ids(r)["dmg-gatekeeper-bypass"]; !ok || sev != analyze.High {
+		t.Errorf("dmg-gatekeeper-bypass missing or not high: %v", ids(r))
+	}
+	if r.Verdict != analyze.VerdictMalicious {
+		t.Errorf("verdict %s (score %d), want Malicious", r.Verdict, r.Score)
+	}
+	waitDetached(t, img)
+}

@@ -229,13 +229,17 @@ func (in *inspector) walkVolume(dir, rel string, depth int) {
 			// The inner image is not mounted, but its bytes are still
 			// analysed: a script or other runnable file with a forged
 			// trailer must not escape inspection by looking like an image.
-			if hidden {
-				in.add(hiddenExec(r))
-			}
+			// A script keeps kind "script" so the Gatekeeper-bypass check
+			// below sees it.
+			kind := "nested image"
 			if isScriptName(name) || hasShebang(abs) {
+				kind = "script"
 				in.add(scriptToRun(r))
+				if hidden {
+					in.add(hiddenExec(r))
+				}
 			}
-			in.analyzeFile(abs, r, "nested image", fileSize(abs))
+			in.analyzeFile(abs, r, kind, fileSize(abs))
 		case f != detect.Unknown:
 			if hidden {
 				in.add(hiddenExec(r))

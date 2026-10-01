@@ -2,6 +2,7 @@ package analyze
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
 	"debug/elf"
 	"debug/macho"
@@ -9,6 +10,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"testing"
 	"time"
@@ -300,6 +302,118 @@ func dynELF(nsyms, strLen, recs int) []byte {
 	}, [][]byte{syms, strtab(strLen), make([]byte, 2*(nsyms+1)), bytes.Repeat(rec, recs)}, nil)
 }
 
+// namedELF lays out an ELF64 ET_DYN with one PT_DYNAMIC program header and
+// the given named sections, followed by a section name table.
+func namedELF(secs []elf.Section64, data [][]byte, names []string) []byte {
+	shstr := []byte{0}
+	for i, n := range names {
+		secs[i].Name = uint32(len(shstr))
+		shstr = append(append(shstr, n...), 0)
+	}
+	nameOff := uint32(len(shstr))
+	shstr = append(shstr, ".shstrtab\x00"...)
+	secs = append(secs, elf.Section64{Name: nameOff, Type: uint32(elf.SHT_STRTAB)})
+	data = append(data, shstr)
+	var body bytes.Buffer
+	const start = 64 + 56
+	for i := range secs {
+		secs[i].Off, secs[i].Size = uint64(start+body.Len()), uint64(len(data[i]))
+		body.Write(data[i])
+	}
+	var b bytes.Buffer
+	binary.Write(&b, binary.LittleEndian, elf.Header64{
+		Ident:     [16]byte{0x7f, 'E', 'L', 'F', byte(elf.ELFCLASS64), byte(elf.ELFDATA2LSB), byte(elf.EV_CURRENT)},
+		Type:      uint16(elf.ET_DYN),
+		Machine:   uint16(elf.EM_X86_64),
+		Version:   uint32(elf.EV_CURRENT),
+		Phoff:     64,
+		Shoff:     uint64(start + body.Len()),
+		Ehsize:    64,
+		Phentsize: 56,
+		Phnum:     1,
+		Shentsize: 64,
+		Shnum:     uint16(len(secs) + 1),
+		Shstrndx:  uint16(len(secs)),
+	})
+	binary.Write(&b, binary.LittleEndian, elf.Prog64{Type: uint32(elf.PT_DYNAMIC), Flags: uint32(elf.PF_R)})
+	b.Write(body.Bytes())
+	binary.Write(&b, binary.LittleEndian, elf.Section64{})
+	for _, s := range secs {
+		binary.Write(&b, binary.LittleEndian, s)
+	}
+	return b.Bytes()
+}
+
+// zdebug wraps b the way debug/elf decompresses any section named
+// ".zdebug*", whatever its flags say.
+func zdebug(b []byte) []byte {
+	var z bytes.Buffer
+	z.WriteString("ZLIB")
+	binary.Write(&z, binary.BigEndian, uint64(len(b)))
+	w, _ := zlib.NewWriterLevel(&z, zlib.BestCompression)
+	w.Write(b)
+	w.Close()
+	return z.Bytes()
+}
+
+// zdebugSymsELF hides a dynamic symbol table of nsyms symbols, all named by
+// one strLen-byte run, behind a legacy ".zdebug" ZLIB header, so the raw
+// bytes are tiny while debug/elf copies nsyms × strLen bytes of names.
+func zdebugSymsELF(nsyms, strLen int) []byte {
+	syms := make([]byte, 24*(nsyms+1))
+	for i := 1; i <= nsyms; i++ {
+		binary.LittleEndian.PutUint32(syms[24*i:], 1)
+		syms[24*i+4] = byte(elf.STB_GLOBAL)<<4 | byte(elf.STT_FUNC)
+	}
+	return namedELF([]elf.Section64{
+		{Type: uint32(elf.SHT_DYNSYM), Link: 2, Entsize: 24},
+		{Type: uint32(elf.SHT_STRTAB)},
+	}, [][]byte{zdebug(syms), strtab(strLen)}, []string{".zdebug_dynsym", ".dynstr"})
+}
+
+// zdebugBombELF names its dynamic string table ".zdebug" and makes it a
+// zlib bomb of n zero bytes.
+func zdebugBombELF(n int) []byte {
+	dyn := make([]byte, 32) // DT_NEEDED 1, DT_NULL
+	binary.LittleEndian.PutUint64(dyn, uint64(elf.DT_NEEDED))
+	binary.LittleEndian.PutUint64(dyn[8:], 1)
+	return namedELF([]elf.Section64{
+		{Type: uint32(elf.SHT_DYNSYM), Link: 2, Entsize: 24},
+		{Type: uint32(elf.SHT_STRTAB)},
+		{Type: uint32(elf.SHT_DYNAMIC), Link: 2, Entsize: 16},
+	}, [][]byte{make([]byte, 48), zdebug(make([]byte, n)), dyn}, []string{".dynsym", ".zdebug_dynstr", ".dynamic"})
+}
+
+// longNamesPE builds a PE32+ with n section headers all named "/4": the
+// NUL-less strLen-byte run at the start of the COFF string table, which
+// debug/pe copies once per section.
+func longNamesPE(n, strLen int) []byte {
+	var b bytes.Buffer
+	dos := make([]byte, 0x40)
+	copy(dos, "MZ")
+	binary.LittleEndian.PutUint32(dos[0x3c:], 0x40)
+	b.Write(dos)
+	b.WriteString("PE\x00\x00")
+	strOff := 0x40 + 4 + 20 + 240 + 40*n
+	binary.Write(&b, binary.LittleEndian, pe.FileHeader{Machine: pe.IMAGE_FILE_MACHINE_AMD64, NumberOfSections: uint16(n),
+		PointerToSymbolTable: uint32(strOff), SizeOfOptionalHeader: 240,
+		Characteristics: pe.IMAGE_FILE_EXECUTABLE_IMAGE | pe.IMAGE_FILE_LARGE_ADDRESS_AWARE})
+	binary.Write(&b, binary.LittleEndian, pe.OptionalHeader64{Magic: 0x20b, ImageBase: 0x140000000, SectionAlignment: 0x1000,
+		FileAlignment: 0x200, SizeOfHeaders: uint32(strOff), NumberOfRvaAndSizes: 16})
+	sh := pe.SectionHeader32{}
+	copy(sh.Name[:], "/4")
+	for range n {
+		binary.Write(&b, binary.LittleEndian, sh)
+	}
+	binary.Write(&b, binary.LittleEndian, uint32(4+strLen))
+	b.Write(bytes.Repeat([]byte("a"), strLen))
+	return b.Bytes()
+}
+
+// heapSlack is the fixed allocation allowance on top of 16 bytes per file
+// byte: the engine's own buffers, rule tables and report.
+const heapSlack = 128 << 20
+
 // TestFormatBudget: crafted header tables must not make the format task run
 // (or keep the file mapped) far past the analysis budget.
 func TestFormatBudget(t *testing.T) {
@@ -318,6 +432,9 @@ func TestFormatBudget(t *testing.T) {
 		{"ELF overlapping section names", "ELF", "elf-table-anomaly", shnamesELF(30000, 2<<20)},
 		{"ELF overlapping dynamic symbol names", "ELF", "elf-table-anomaly", dynELF(100000, 2<<20, 1)},
 		{"ELF overlapping version records", "ELF", "elf-table-anomaly", dynELF(1, 1, 1<<16)},
+		{"ELF .zdebug dynamic symbols", "ELF", "elf-table-anomaly", zdebugSymsELF(20000, 32<<10)},
+		{"ELF .zdebug string table bomb", "ELF", "elf-table-anomaly", zdebugBombELF(64 << 20)},
+		{"PE long section names", "PE", "pe-table-anomaly", longNamesPE(2000, 256<<10)},
 	}
 	// Generous for -race on a loaded machine; unbounded parsing takes far longer.
 	budget := 2 * time.Second
@@ -328,12 +445,21 @@ func TestFormatBudget(t *testing.T) {
 			if err := os.WriteFile(path, c.data, 0o600); err != nil {
 				t.Fatal(err)
 			}
+			runtime.GC()
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
 			start := time.Now()
 			r, released := eng.AnalyzeWait(context.Background(), path, Meta{})
 			select {
 			case <-released:
 			case <-time.After(budget + 3*time.Second):
 				t.Fatalf("analysis goroutines still running %v after start (budget %v)", time.Since(start), budget)
+			}
+			// Memory, like time, must stay linear in the file: allocation
+			// amplification is the same attack as a stalled parser.
+			runtime.ReadMemStats(&after)
+			if alloc, limit := after.TotalAlloc-before.TotalAlloc, 16*uint64(len(c.data))+heapSlack; alloc > limit {
+				t.Errorf("analysis allocated %d MiB for a %d KiB file (limit %d MiB)", alloc>>20, len(c.data)>>10, limit>>20)
 			}
 			if r.Format != c.format {
 				t.Fatalf("format = %q, want %q", r.Format, c.format)

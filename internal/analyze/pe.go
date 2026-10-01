@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -35,7 +36,7 @@ const (
 )
 
 func analyzePE(ctx context.Context, data []byte) (*formatResult, error) {
-	r, relocs := peHeaderReader(data)
+	r, relocs, craftedNames := peHeaderReader(data)
 	f, err := pe.NewFile(r)
 	if err != nil {
 		return nil, err
@@ -49,6 +50,9 @@ func analyzePE(ctx context.Context, data []byte) (*formatResult, error) {
 	if 10*relocs > uint64(len(data)) {
 		add("pe-reloc-anomaly", "COFF relocation tables describe more data than the file holds", "Images carry no COFF relocations; tables like these are crafted to stall analysis tools.", Medium,
 			fmt.Sprintf("%d relocations", relocs))
+	}
+	if craftedNames {
+		add("pe-table-anomaly", "Crafted section name table", "Long section names overlap in one long run of the COFF string table; linkers never emit that, and it stalls analysis tools, so those names were not read.", Medium)
 	}
 
 	sl := Slice{Arch: peMachines[f.Machine], Props: map[string]string{}}
@@ -270,9 +274,13 @@ func analyzePE(ctx context.Context, data []byte) (*formatResult, error) {
 // symbol table and every section's relocation count hidden. debug/pe reads
 // both eagerly, and crafted headers make that sections × relocations (or
 // symbols × string length) work; images use neither and the loader ignores
-// them. The string table, which long section names live in, stays readable.
-// relocs is the total relocation count the section headers claimed.
-func peHeaderReader(data []byte) (r io.ReaderAt, relocs uint64) {
+// them. The string table, which long section names live in, stays readable,
+// but debug/pe copies one name per "/N" section header up to the next NUL,
+// so names overlapping one long unterminated run cost sections × length.
+// When they would cost more than nameAllowance, every long name is blanked
+// in the headers instead (craftedNames). relocs is the total relocation
+// count the section headers claimed.
+func peHeaderReader(data []byte) (r io.ReaderAt, relocs uint64, craftedNames bool) {
 	le := binary.LittleEndian
 	base := uint64(0)
 	if len(data) >= 0x40 && data[0] == 'M' && data[1] == 'Z' {
@@ -280,19 +288,57 @@ func peHeaderReader(data []byte) (r io.ReaderAt, relocs uint64) {
 	}
 	fh := sub(data, base, 20)
 	if len(fh) < 20 {
-		return bytes.NewReader(data), 0
+		return bytes.NewReader(data), 0, false
 	}
 	shoff := 20 + uint64(le.Uint16(fh[16:]))
 	hdrs := bytes.Clone(sub(data, base, shoff+40*uint64(le.Uint16(fh[2:]))))
-	if pts, n := le.Uint32(hdrs[8:]), le.Uint32(hdrs[12:]); pts != 0 && n != 0 {
-		le.PutUint32(hdrs[8:], pts+18*n) // where debug/pe looks for the string table
+	pts, n := le.Uint32(hdrs[8:]), le.Uint32(hdrs[12:])
+	stOff := pts + 18*n // where debug/pe looks for the string table (uint32, as there)
+	if pts != 0 && n != 0 {
+		le.PutUint32(hdrs[8:], stOff)
 		le.PutUint32(hdrs[12:], 0)
 	}
-	for sh := hdrs[min(shoff, uint64(len(hdrs))):]; len(sh) >= 40; sh = sh[40:] {
+	secs := hdrs[min(shoff, uint64(len(hdrs))):]
+	for sh := secs; len(sh) >= 40; sh = sh[40:] {
 		relocs += uint64(le.Uint16(sh[32:]))
 		le.PutUint16(sh[32:], 0)
 	}
-	return readerWith(data, []patch{{int64(base), hdrs}}), relocs
+	ps := []patch{{int64(base), hdrs}}
+	if pts == 0 {
+		return readerWith(data, ps), relocs, false
+	}
+	// The string table as debug/pe will see it, through the patched view.
+	var lb [4]byte
+	view := readerWith(data, ps)
+	if n, _ := view.ReadAt(lb[:], int64(stOff)); n < 4 || le.Uint32(lb[:]) <= 4 {
+		return view, relocs, false
+	}
+	tab := make([]byte, min(uint64(le.Uint32(lb[:])-4), uint64(len(data))))
+	k, _ := view.ReadAt(tab, int64(stOff)+4)
+	tab = tab[:k]
+	longNames := func(yield func(uint64) bool) {
+		for sh := secs; len(sh) >= 40; sh = sh[40:] {
+			if sh[0] != '/' {
+				continue
+			}
+			i, err := strconv.Atoi(cstr(sh[1:8]))
+			if err != nil || uint32(i) < 4 { // debug/pe rejects the file
+				continue
+			}
+			if !yield(uint64(uint32(i) - 4)) {
+				return
+			}
+		}
+	}
+	if left := nameAllowance(len(tab)); !namesFit(tab, longNames, &left) {
+		for sh := secs; len(sh) >= 40; sh = sh[40:] {
+			if sh[0] == '/' {
+				clear(sh[:8])
+			}
+		}
+		craftedNames = true
+	}
+	return readerWith(data, ps), relocs, craftedNames
 }
 
 // peImports returns the same "name:dll" list as debug/pe's ImportedSymbols,

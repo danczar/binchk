@@ -280,27 +280,42 @@ func elfHeaderReader(data []byte) (io.ReaderAt, bool) {
 // and symbol version lookups stay roughly linear in the file size. Their
 // names can all point into one long run, the version tables are linked lists
 // whose entries may overlap, and every symbol scans every version; the
-// tables may also claim to be compressed, which no loader accepts.
+// tables may also be compressed (SHF_COMPRESSED, or a legacy ".zdebug" name
+// with a ZLIB header), which no loader accepts and which turns them into
+// decompression bombs whose cost the raw bytes do not show.
 func elfDynamicFits(f *elf.File, data []byte) bool {
 	bo := f.ByteOrder
 	is64 := f.Class == elf.ELFCLASS64
-	raw := func(s *elf.Section) []byte {
+	// view returns the bytes debug/elf reads for s, which must be exactly
+	// the raw file bytes: any decompression path debug/elf takes, now or in
+	// a later release, shows up as a difference. Reading stops one byte past
+	// the raw size, so a bomb costs no more than the bytes it occupies.
+	fits := true
+	view := func(s *elf.Section) []byte {
 		if s == nil || s.Type == elf.SHT_NOBITS {
 			return nil
 		}
-		return sub(data, s.Offset, s.FileSize)
+		b := sub(data, s.Offset, s.FileSize)
+		got, err := io.ReadAll(io.LimitReader(s.Open(), int64(len(b))+1))
+		if err != nil || !bytes.Equal(got, b) {
+			fits = false
+		}
+		return b
 	}
-	strtab := func(s *elf.Section) ([]byte, bool) {
+	link := func(s *elf.Section) *elf.Section {
 		if s == nil || s.Link == 0 || int(s.Link) >= len(f.Sections) {
-			return nil, true
+			return nil
 		}
-		st := f.Sections[s.Link]
-		return raw(st), st.Flags&elf.SHF_COMPRESSED == 0
+		return f.Sections[s.Link]
 	}
-	for _, t := range []elf.SectionType{elf.SHT_DYNSYM, elf.SHT_DYNAMIC, elf.SHT_GNU_VERSYM, elf.SHT_GNU_VERNEED, elf.SHT_GNU_VERDEF} {
-		if s := f.SectionByType(t); s != nil && s.Flags&elf.SHF_COMPRESSED != 0 {
-			return false
-		}
+	dynsym, dyn := f.SectionByType(elf.SHT_DYNSYM), f.SectionByType(elf.SHT_DYNAMIC)
+	syms, dynstr := view(dynsym), view(link(dynsym))
+	dynb, dyntab := view(dyn), view(link(dyn))
+	verdef, verneed := view(f.SectionByType(elf.SHT_GNU_VERDEF)), view(f.SectionByType(elf.SHT_GNU_VERNEED))
+	versym := f.SectionByType(elf.SHT_GNU_VERSYM)
+	view(versym)
+	if !fits {
+		return false
 	}
 	left := nameAllowance(len(data))
 	name := func(tab []byte, off uint64) bool {
@@ -308,33 +323,23 @@ func elfDynamicFits(f *elf.File, data []byte) bool {
 	}
 
 	// ImportedSymbols and DynamicSymbols each decode every name.
-	dynsym := f.SectionByType(elf.SHT_DYNSYM)
-	dynstr, ok := strtab(dynsym)
-	if !ok {
-		return false
-	}
 	stride := map[bool]int{false: 16, true: 24}[is64]
-	nsyms := uint64(len(raw(dynsym)) / stride)
+	nsyms := uint64(len(syms) / stride)
 	for range 2 {
-		if !namesFit(dynstr, nameOffsets(raw(dynsym), stride, bo), &left) {
+		if !namesFit(dynstr, nameOffsets(syms, stride, bo), &left) {
 			return false
 		}
 	}
 
-	dyn := f.SectionByType(elf.SHT_DYNAMIC)
-	tab, ok := strtab(dyn)
-	if !ok {
-		return false
-	}
 	stride = map[bool]int{false: 8, true: 16}[is64]
-	for b := raw(dyn); len(b) >= stride; b = b[stride:] {
+	for b := dynb; len(b) >= stride; b = b[stride:] {
 		tag, val := elf.DynTag(int32(bo.Uint32(b))), uint64(bo.Uint32(b[4:]))
 		if is64 {
 			tag, val = elf.DynTag(int64(bo.Uint64(b))), bo.Uint64(b[8:])
 		}
 		switch tag {
 		case elf.DT_NEEDED, elf.DT_SONAME, elf.DT_RPATH, elf.DT_RUNPATH:
-			if !name(tab, val) {
+			if !name(dyntab, val) {
 				return false
 			}
 		}
@@ -378,9 +383,9 @@ func elfDynamicFits(f *elf.File, data []byte) bool {
 		}
 		return true
 	}
-	if f.SectionByType(elf.SHT_GNU_VERSYM) != nil {
+	if versym != nil {
 		for range 2 {
-			if !walk(raw(f.SectionByType(elf.SHT_GNU_VERDEF)), 20, 8, false) || !walk(raw(f.SectionByType(elf.SHT_GNU_VERNEED)), 16, 16, true) {
+			if !walk(verdef, 20, 8, false) || !walk(verneed, 16, 16, true) {
 				return false
 			}
 		}

@@ -81,7 +81,7 @@ func parserReader(data []byte) io.ReaderAt {
 	var r io.ReaderAt
 	switch {
 	case bytes.HasPrefix(data, []byte("MZ")):
-		r, _ = peHeaderReader(data)
+		r, _, _ = peHeaderReader(data)
 	case bytes.HasPrefix(data, []byte("\xca\xfe\xba\xbe")):
 		r, _, _ = fatHeaderReader(data)
 	case bytes.HasPrefix(data, []byte("\x7fELF")):

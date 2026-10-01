@@ -63,9 +63,9 @@ type session struct {
 	// OS signature verification result, if it ran.
 	verified     *bool
 	verifyDetail string
-	// inContainer: the enclosing container verifies the signature that
-	// covers this file (Meta.SkipVerify).
-	inContainer bool
+	// sealed: the enclosing container verifies the bundle seal that covers
+	// this file (Meta.Sealed).
+	sealed bool
 }
 
 func (s *session) commit(f func()) bool {
@@ -136,7 +136,7 @@ func (e *Engine) AnalyzeWait(parent context.Context, path string, meta Meta) (*R
 
 	ctx, cancel := context.WithTimeout(parent, e.opt.Budget)
 	defer cancel()
-	s := &session{r: r, inContainer: meta.SkipVerify}
+	s := &session{r: r, sealed: meta.SkipVerify && meta.Sealed}
 
 	hashTask := func(name string, h hash.Hash, dst *string) task {
 		return task{name, func(ctx context.Context) error {
@@ -284,7 +284,7 @@ func (e *Engine) correlate(s *session, format detect.Format) {
 	}
 	fs = append(fs, s.goFinds...)
 	installer := false
-	engineMarkers := 0 // distinct Chromium/Electron strings
+	engineMarkers := 0 // distinct Chromium/Electron strings: a hint, not proof
 
 	if c := s.content; c != nil {
 		r.Entropy = entropy(&c.hist, uint64(r.Size))
@@ -387,7 +387,7 @@ func (e *Engine) correlate(s *session, format detect.Format) {
 	// Browser engines (Chromium, CEF, Electron) legitimately manage browser
 	// profiles and register global hotkeys. Only these inherent findings are
 	// demoted; multi-browser and wallet harvesting still count in full.
-	if browserEngine(r, engineMarkers, s.inContainer, fs) {
+	if browserEngine(r, engineMarkers, s.sealed, fs) {
 		for i := range fs {
 			switch fs[i].ID {
 			case "stealer-cred-files", "api-keylogging", "api-priv-exec-mac":
@@ -478,8 +478,9 @@ func HashFile(ctx context.Context, path string) (Hashes, error) {
 // rather than something that merely mentions one: the marker strings are
 // free for malware to embed, so they only count alongside an identified
 // developer's signature on a native binary, and never next to harvesting
-// or exfiltration signals.
-func browserEngine(r *Report, markers int, inContainer bool, fs []Finding) bool {
+// or exfiltration signals. The parsed signature is not checked
+// cryptographically, so unverified it counts only when sealed.
+func browserEngine(r *Report, markers int, sealed bool, fs []Finding) bool {
 	if markers < 2 || r.Format == "unknown" || r.Format == "script" {
 		return false
 	}
@@ -500,14 +501,15 @@ func browserEngine(r *Report, markers int, inContainer bool, fs []Finding) bool 
 	if sig.Verified != nil {
 		return *sig.Verified
 	}
-	// Unverified: only inside a container, which checks the bundle's seal
-	// itself, and only for an engine library exporting a real API (CEF's C
-	// API alone is ~200 symbols; Electron exports thousands).
+	// Unverified: only inside an app bundle whose seal the container checks
+	// (nothing checks a loose file in a disk image or package), and only for
+	// an engine library exporting a real API (CEF's C API alone is ~200
+	// symbols; Electron exports thousands).
 	exports := 0
 	for _, sl := range r.Slices {
 		exports = max(exports, sl.ExportCount)
 	}
-	return inContainer && sig.TeamID != "" && exports >= 100
+	return sealed && sig.TeamID != "" && exports >= 100
 }
 
 func hasNote(notes []string, prefix string) bool {

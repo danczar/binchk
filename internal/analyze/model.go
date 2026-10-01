@@ -245,4 +245,8 @@ type Meta struct {
 	// SkipVerify disables per-file OS signature verification (containers
 	// verify whole bundles instead).
 	SkipVerify bool
+	// Sealed: with SkipVerify, the file is inside an app bundle whose seal
+	// the container checks (codesign --deep) and reports if broken. Loose
+	// files in a container have nothing vouching for their signature.
+	Sealed bool
 }

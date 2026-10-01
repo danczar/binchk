@@ -175,6 +175,12 @@ func (in *inspector) goTask(fn func()) {
 // analyzeFile queues one contained file for full engine analysis. rel is
 // the display path inside the container.
 func (in *inspector) analyzeFile(abs, rel, kind string, size int64) {
+	in.analyzeIn(abs, rel, kind, size, false)
+}
+
+// analyzeIn is analyzeFile for a file whose enclosing app bundle has its
+// seal checked (sealed), which then vouches for the file's signature.
+func (in *inspector) analyzeIn(abs, rel, kind string, size int64, sealed bool) {
 	in.mu.Lock()
 	if in.files >= maxFiles || in.bytes+size > maxBytes {
 		in.c.Skipped++
@@ -193,7 +199,7 @@ func (in *inspector) analyzeFile(abs, rel, kind string, size int64) {
 			in.mu.Unlock()
 			return
 		}
-		cr, released := in.eng.AnalyzeWait(in.ctx, abs, analyze.Meta{FileName: filepath.Base(rel), OriginalPath: rel, SkipVerify: true})
+		cr, released := in.eng.AnalyzeWait(in.ctx, abs, analyze.Meta{FileName: filepath.Base(rel), OriginalPath: rel, SkipVerify: true, Sealed: sealed})
 		<-in.sem
 		cf := analyze.ContainedFile{
 			Path: rel, Kind: kind, Format: cr.Format, Arches: cr.Arches, Size: cr.Size, SHA256: cr.Hashes.SHA256,

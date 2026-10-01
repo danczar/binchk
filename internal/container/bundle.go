@@ -181,7 +181,7 @@ func (in *inspector) inspectApp(abs, rel string, assess, partial bool) {
 	}
 	in.goTask(func() {
 		t0 := time.Now()
-		in.bundleCode(abs, rel, mainPath, func(c cand) { in.analyzeFile(c.abs, c.rel, c.kind, c.size) })
+		in.bundleCode(abs, rel, mainPath, func(c cand) { in.analyzeIn(c.abs, c.rel, c.kind, c.size, !partial) })
 		in.timed("scan bundle "+rel, t0, in.ctx.Err())
 	})
 

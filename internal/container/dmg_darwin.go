@@ -226,6 +226,16 @@ func (in *inspector) walkVolume(dir, rel string, depth int) {
 			in.add(analyze.Finding{ID: "dmg-nested", Title: "Disk image inside a disk image",
 				Detail: "Nesting hides content from single-level inspection; the inner image was not opened.", Severity: analyze.Low,
 				Category: "defense-evasion", Evidence: []string{r}})
+			// The inner image is not mounted, but its bytes are still
+			// analysed: a script or other runnable file with a forged
+			// trailer must not escape inspection by looking like an image.
+			if hidden {
+				in.add(hiddenExec(r))
+			}
+			if isScriptName(name) || hasShebang(abs) {
+				in.add(scriptToRun(r))
+			}
+			in.analyzeFile(abs, r, "nested image", fileSize(abs))
 		case f != detect.Unknown:
 			if hidden {
 				in.add(hiddenExec(r))
@@ -235,12 +245,16 @@ func (in *inspector) walkVolume(dir, rel string, depth int) {
 			if hidden {
 				in.add(hiddenExec(r))
 			}
-			in.add(analyze.Finding{ID: "dmg-script", Title: "Disk image contains a script to run",
-				Detail:   "\"Double-click this to install\" scripts (.command, .sh) bypass Gatekeeper's app checks; fake installers use them to run commands directly.",
-				Severity: analyze.Medium, Category: "execution", Evidence: []string{r}})
+			in.add(scriptToRun(r))
 			in.analyzeFile(abs, r, "script", fileSize(abs))
 		}
 	}
+}
+
+func scriptToRun(rel string) analyze.Finding {
+	return analyze.Finding{ID: "dmg-script", Title: "Disk image contains a script to run",
+		Detail:   "\"Double-click this to install\" scripts (.command, .sh) bypass Gatekeeper's app checks; fake installers use them to run commands directly.",
+		Severity: analyze.Medium, Category: "execution", Evidence: []string{rel}}
 }
 
 func hiddenExec(rel string) analyze.Finding {

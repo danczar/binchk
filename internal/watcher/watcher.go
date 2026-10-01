@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -77,9 +78,99 @@ type Watcher struct {
 	skip      func(path string) bool
 	recursive map[string]bool // watched root -> recursive
 	pending   map[string]*pending
-	seen      map[string]time.Time // path -> mtime already reported
-	log       *log.Logger
-	out       chan Found
+	// known holds what was already in the folders at startup and every
+	// settled file since, so attribute changes and repeat events on them
+	// are not taken for new downloads.
+	known map[string]*ident
+	clock uint64 // advances on every use of a known entry (LRU order)
+	log   *log.Logger
+	out   chan Found
+}
+
+// maxKnown bounds known; the least recently used entries are evicted.
+const maxKnown = 1 << 16
+
+// ident identifies a file's content well enough to tell a new download
+// from an attribute change: chmod and xattr writes leave the inode, size
+// and mtime alone.
+type ident struct {
+	fi    os.FileInfo // files only: the inode
+	count int         // bundles only: entries in the tree
+	size  int64
+	mtime time.Time
+	used  uint64
+}
+
+func fileIdent(st os.FileInfo) *ident {
+	// On Windows the file ID is loaded lazily from the path; pin it now,
+	// before the path can point at a different file.
+	os.SameFile(st, st)
+	return &ident{fi: st, size: st.Size(), mtime: st.ModTime()}
+}
+
+func (a *ident) same(b *ident) bool {
+	if a.count != b.count || a.size != b.size || !a.mtime.Equal(b.mtime) || (a.fi == nil) != (b.fi == nil) {
+		return false
+	}
+	return a.fi == nil || os.SameFile(a.fi, b.fi)
+}
+
+// isKnown reports whether p is already known in exactly state id.
+func (w *Watcher) isKnown(p string, id *ident) bool {
+	k, ok := w.known[p]
+	if !ok || !k.same(id) {
+		return false
+	}
+	w.clock++
+	k.used = w.clock
+	return true
+}
+
+func (w *Watcher) remember(p string, id *ident) {
+	w.clock++
+	id.used = w.clock
+	w.known[p] = id
+	if len(w.known) <= maxKnown {
+		return
+	}
+	// Evict the least recently used quarter in one go.
+	used := make([]uint64, 0, len(w.known))
+	for _, k := range w.known {
+		used = append(used, k.used)
+	}
+	slices.Sort(used)
+	cut := used[len(used)/4]
+	for kp, k := range w.known {
+		if k.used < cut {
+			delete(w.known, kp)
+		}
+	}
+}
+
+// baseline records what is already in a watched folder. Those entries are
+// the user's existing files, not new downloads, and are never analysed
+// unless their content changes.
+func (w *Watcher) baseline(root string, recursive bool) {
+	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		switch {
+		case err != nil:
+			if d != nil && d.IsDir() {
+				return filepath.SkipDir
+			}
+		case d.IsDir() && p != root && isAppDir(p):
+			id := &ident{}
+			id.count, id.size, id.mtime = treeState(p)
+			w.remember(p, id)
+			return filepath.SkipDir
+		case d.IsDir() && p != root && (!recursive || (w.skip != nil && w.skip(p)) || inBundle(filepath.Join(p, "x"))):
+			return filepath.SkipDir
+		case d.Type().IsRegular():
+			if st, err := os.Lstat(p); err == nil {
+				w.remember(p, fileIdent(st))
+			}
+		}
+		return nil
+	})
 }
 
 // New starts watching dirs. skip, if non-nil, excludes paths (e.g. binchk's
@@ -92,7 +183,7 @@ func New(dirs []config.WatchDir, settle time.Duration, ignoreExts []string, skip
 	w := &Watcher{
 		fsw: fsw, settle: settle, skip: skip, log: lg,
 		ignoreExt: map[string]bool{}, recursive: map[string]bool{},
-		pending: map[string]*pending{}, seen: map[string]time.Time{},
+		pending: map[string]*pending{}, known: map[string]*ident{},
 		out: make(chan Found, 64),
 	}
 	for _, e := range ignoreExts {
@@ -108,6 +199,7 @@ func New(dirs []config.WatchDir, settle time.Duration, ignoreExts []string, skip
 			continue
 		}
 		w.recursive[abs] = d.Recursive
+		w.baseline(abs, d.Recursive)
 		lg.Printf("watching %s (recursive=%v)", abs, d.Recursive)
 	}
 	return w, nil
@@ -251,6 +343,9 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 	if !st.Mode().IsRegular() {
 		return
 	}
+	if !ev.Has(fsnotify.Create) && !ev.Has(fsnotify.Write) && w.isKnown(p, fileIdent(st)) {
+		return // attribute change only; the content is one we already know
+	}
 	w.touch(p)
 }
 
@@ -304,16 +399,14 @@ func (w *Watcher) poll(now time.Time) {
 		if st.Size() == 0 {
 			continue
 		}
-		if m, ok := w.seen[p]; ok && m.Equal(st.ModTime()) {
+		id := fileIdent(st)
+		if w.isKnown(p, id) {
 			continue
 		}
+		w.remember(p, id)
 		f := detect.SniffFile(p)
 		if f == detect.Unknown {
 			continue
-		}
-		w.seen[p] = st.ModTime()
-		if len(w.seen) > 4096 {
-			clear(w.seen)
 		}
 		select {
 		case w.out <- Found{Path: p, Format: f, At: pd.last}:
@@ -343,10 +436,11 @@ func (w *Watcher) pollBundle(p string, pd *pending, now time.Time) {
 		return
 	}
 	delete(w.pending, p)
-	if m, ok := w.seen[p]; ok && m.Equal(mtime) {
+	id := &ident{count: count, size: size, mtime: mtime}
+	if w.isKnown(p, id) {
 		return
 	}
-	w.seen[p] = mtime
+	w.remember(p, id)
 	select {
 	case w.out <- Found{Path: p, Format: detect.AppBundle, At: pd.last}:
 	default:
@@ -357,6 +451,7 @@ func (w *Watcher) pollBundle(p string, pd *pending, now time.Time) {
 // ScanExisting queues every file already present in the watched folders.
 // It must be called before Run.
 func (w *Watcher) ScanExisting() {
+	clear(w.known) // an explicit sweep overrides the startup baseline
 	for root, rec := range w.recursive {
 		filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 			if err != nil {

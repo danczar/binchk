@@ -187,11 +187,16 @@ var printable8 = func() (t [256]uint8) {
 // — because on binary data printable/non-printable bytes alternate
 // unpredictably and a branchy loop spends most of its time mispredicting.
 // The only branch is "a long-enough run just ended", which is rare.
+// noEmit starts a run counter so low that it cannot reach a minimum string
+// length within one chunk (chunks are far below 2 GiB). It must fit a 32-bit
+// int: binchk also builds for 386 and arm.
+const noEmit = math.MinInt32
+
 func extractStrings(data []byte, start, end int, o *chunkOut) {
 	// ASCII
 	run := 0
 	if start > 0 && printable[data[start-1]] {
-		run = -1 << 40 // continuation of the previous chunk's run: never emit
+		run = noEmit // continuation of the previous chunk's run: never emit
 	}
 	// Test run length first: that branch is almost always false and so
 	// well predicted; p==0 alone is a coin flip on binary data.
@@ -223,7 +228,7 @@ func extractStrings(data []byte, start, end int, o *chunkOut) {
 	}
 	run = 0
 	if start >= 2 && isW(start-2) == 1 {
-		run = -1 << 40
+		run = noEmit
 	}
 	lim := min(end, len(data)-1)
 	i = start

@@ -63,6 +63,9 @@ type session struct {
 	// OS signature verification result, if it ran.
 	verified     *bool
 	verifyDetail string
+	// inContainer: the enclosing container verifies the signature that
+	// covers this file (Meta.SkipVerify).
+	inContainer bool
 }
 
 func (s *session) commit(f func()) bool {
@@ -133,7 +136,7 @@ func (e *Engine) AnalyzeWait(parent context.Context, path string, meta Meta) (*R
 
 	ctx, cancel := context.WithTimeout(parent, e.opt.Budget)
 	defer cancel()
-	s := &session{r: r}
+	s := &session{r: r, inContainer: meta.SkipVerify}
 
 	hashTask := func(name string, h hash.Hash, dst *string) task {
 		return task{name, func(ctx context.Context) error {
@@ -281,6 +284,7 @@ func (e *Engine) correlate(s *session, format detect.Format) {
 	}
 	fs = append(fs, s.goFinds...)
 	installer := false
+	engineMarkers := 0 // distinct Chromium/Electron strings
 
 	if c := s.content; c != nil {
 		r.Entropy = entropy(&c.hist, uint64(r.Size))
@@ -314,6 +318,9 @@ func (e *Engine) correlate(s *session, format detect.Format) {
 				r.Toolchain.Notes = append(r.Toolchain.Notes, rule.ID)
 				if strings.Contains(rule.ID, "installer") {
 					installer = true
+				}
+				if strings.HasPrefix(rule.ID, "Chromium") || strings.HasPrefix(rule.ID, "Electron") {
+					engineMarkers += len(m)
 				}
 				continue
 			}
@@ -380,7 +387,7 @@ func (e *Engine) correlate(s *session, format detect.Format) {
 	// Browser engines (Chromium, CEF, Electron) legitimately manage browser
 	// profiles and register global hotkeys. Only these inherent findings are
 	// demoted; multi-browser and wallet harvesting still count in full.
-	if hasNote(r.Toolchain.Notes, "Chromium") || hasNote(r.Toolchain.Notes, "Electron") {
+	if browserEngine(r, engineMarkers, s.inContainer, fs) {
 		for i := range fs {
 			switch fs[i].ID {
 			case "stealer-cred-files", "api-keylogging", "api-priv-exec-mac":
@@ -465,6 +472,42 @@ func HashFile(ctx context.Context, path string) (Hashes, error) {
 	}
 	wg.Wait()
 	return h, ctx.Err()
+}
+
+// browserEngine reports whether r is really a Chromium/CEF/Electron engine
+// rather than something that merely mentions one: the marker strings are
+// free for malware to embed, so they only count alongside an identified
+// developer's signature on a native binary, and never next to harvesting
+// or exfiltration signals.
+func browserEngine(r *Report, markers int, inContainer bool, fs []Finding) bool {
+	if markers < 2 || r.Format == "unknown" || r.Format == "script" {
+		return false
+	}
+	for _, f := range fs {
+		switch f.ID {
+		case "stealer-browsers", "stealer-wallets", "stealer-apps", "mac-fake-password-prompt", "exfil-webhooks":
+			return false
+		case "keychain-theft":
+			if f.Severity >= High {
+				return false
+			}
+		}
+	}
+	sig := r.Signature
+	if !sig.Present || sig.AdHoc || sig.Signer == "" {
+		return false
+	}
+	if sig.Verified != nil {
+		return *sig.Verified
+	}
+	// Unverified: only inside a container, which checks the bundle's seal
+	// itself, and only for an engine library exporting a real API (CEF's C
+	// API alone is ~200 symbols; Electron exports thousands).
+	exports := 0
+	for _, sl := range r.Slices {
+		exports = max(exports, sl.ExportCount)
+	}
+	return inContainer && sig.TeamID != "" && exports >= 100
 }
 
 func hasNote(notes []string, prefix string) bool {

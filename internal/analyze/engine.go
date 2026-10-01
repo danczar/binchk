@@ -63,6 +63,9 @@ type session struct {
 	// OS signature verification result, if it ran.
 	verified     *bool
 	verifyDetail string
+	// sealed: the file sits in an app bundle whose seal the container
+	// checks and feeds back (Meta.Sealed).
+	sealed bool
 }
 
 func (s *session) commit(f func()) bool {
@@ -133,7 +136,7 @@ func (e *Engine) AnalyzeWait(parent context.Context, path string, meta Meta) (*R
 
 	ctx, cancel := context.WithTimeout(parent, e.opt.Budget)
 	defer cancel()
-	s := &session{r: r}
+	s := &session{r: r, sealed: meta.SkipVerify && meta.Sealed}
 
 	hashTask := func(name string, h hash.Hash, dst *string) task {
 		return task{name, func(ctx context.Context) error {
@@ -284,6 +287,7 @@ func (e *Engine) correlate(s *session, format detect.Format) {
 	}
 	fs = append(fs, s.goFinds...)
 	installer := false
+	engineMarkers := 0 // distinct Chromium/Electron strings: a hint, not proof
 
 	if c := s.content; c != nil {
 		r.Entropy = entropy(&c.hist, uint64(r.Size))
@@ -317,6 +321,9 @@ func (e *Engine) correlate(s *session, format detect.Format) {
 				r.Toolchain.Notes = append(r.Toolchain.Notes, rule.ID)
 				if strings.Contains(rule.ID, "installer") {
 					installer = true
+				}
+				if strings.HasPrefix(rule.ID, "Chromium") || strings.HasPrefix(rule.ID, "Electron") {
+					engineMarkers += len(m)
 				}
 				continue
 			}
@@ -383,14 +390,14 @@ func (e *Engine) correlate(s *session, format detect.Format) {
 	// Browser engines (Chromium, CEF, Electron) legitimately manage browser
 	// profiles and register global hotkeys. Only these inherent findings are
 	// demoted; multi-browser and wallet harvesting still count in full.
-	if hasNote(r.Toolchain.Notes, "Chromium") || hasNote(r.Toolchain.Notes, "Electron") {
-		for i := range fs {
-			switch fs[i].ID {
-			case "stealer-cred-files", "api-keylogging", "api-priv-exec-mac":
-				fs[i].Severity = Info
-				fs[i].Detail = strings.TrimSpace(fs[i].Detail + " Expected in an embedded Chromium browser engine.")
-			}
-		}
+	// An engine whose signature only the enclosing bundle's seal can vouch
+	// for is left at full severity here; the container demotes it once the
+	// seal has actually verified (ConfirmBrowserEngine).
+	switch browserEngine(r, engineMarkers, s.sealed, fs) {
+	case engineTrusted:
+		demoteEngine(fs)
+	case enginePending:
+		r.EnginePending = true
 	}
 
 	if r.Entropy > 7.2 && r.Size > 32<<10 {
@@ -468,6 +475,90 @@ func HashFile(ctx context.Context, path string) (Hashes, error) {
 	}
 	wg.Wait()
 	return h, ctx.Err()
+}
+
+// engineTrust is browserEngine's verdict.
+type engineTrust int
+
+const (
+	engineNone    engineTrust = iota // not a trusted engine: no demotion
+	engineTrusted                    // OS-verified signature: demote now
+	// enginePending: everything holds except that the signature was only
+	// parsed. The enclosing app bundle's seal check decides; until a
+	// container confirms it, nothing is demoted.
+	enginePending
+)
+
+// demoteEngine drops the findings inherent to a browser engine to Info.
+func demoteEngine(fs []Finding) {
+	for i := range fs {
+		switch fs[i].ID {
+		case "stealer-cred-files", "api-keylogging", "api-priv-exec-mac":
+			if fs[i].Severity != Info {
+				fs[i].Severity = Info
+				fs[i].Detail = strings.TrimSpace(fs[i].Detail + " Expected in an embedded Chromium browser engine.")
+			}
+		}
+	}
+}
+
+// ConfirmBrowserEngine applies the deferred browser-engine demotion to a
+// report marked EnginePending and rescores it. Containers call it only once
+// the app bundle holding the file has been verified: its seal checked by
+// codesign --deep with an identified developer's signature that Gatekeeper
+// did not reject, or the whole disk image notarized.
+func (e *Engine) ConfirmBrowserEngine(r *Report) {
+	if !r.EnginePending {
+		return
+	}
+	r.EnginePending = false
+	demoteEngine(r.Findings)
+	r.Findings = dedupe(r.Findings)
+	score(r, e.opt.Allowlist)
+}
+
+// browserEngine reports whether r is really a Chromium/CEF/Electron engine
+// rather than something that merely mentions one: the marker strings are
+// free for malware to embed, so they only count alongside an identified
+// developer's signature on a native binary, and never next to harvesting
+// or exfiltration signals. The parsed signature is not checked
+// cryptographically, so unverified it is at most pending (sealed only).
+func browserEngine(r *Report, markers int, sealed bool, fs []Finding) engineTrust {
+	if markers < 2 || r.Format == "unknown" || r.Format == "script" {
+		return engineNone
+	}
+	for _, f := range fs {
+		switch f.ID {
+		case "stealer-browsers", "stealer-wallets", "stealer-apps", "mac-fake-password-prompt", "exfil-webhooks":
+			return engineNone
+		case "keychain-theft":
+			if f.Severity >= High {
+				return engineNone
+			}
+		}
+	}
+	sig := r.Signature
+	if !sig.Present || sig.AdHoc || sig.Signer == "" {
+		return engineNone
+	}
+	if sig.Verified != nil {
+		if *sig.Verified {
+			return engineTrusted
+		}
+		return engineNone
+	}
+	// Unverified: only inside an app bundle whose seal the container checks
+	// (nothing checks a loose file in a disk image or package), and only for
+	// an engine library exporting a real API (CEF's C API alone is ~200
+	// symbols; Electron exports thousands).
+	exports := 0
+	for _, sl := range r.Slices {
+		exports = max(exports, sl.ExportCount)
+	}
+	if sealed && sig.TeamID != "" && exports >= 100 {
+		return enginePending
+	}
+	return engineNone
 }
 
 func hasNote(notes []string, prefix string) bool {

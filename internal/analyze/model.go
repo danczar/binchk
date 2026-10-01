@@ -193,6 +193,9 @@ type Report struct {
 	// Elapsed is analysis wall time; Latency is detection -> report ready.
 	Elapsed time.Duration `json:"elapsed"`
 	Latency time.Duration `json:"latency,omitempty"`
+	// EnginePending: a browser engine whose demotion awaits the enclosing
+	// bundle's seal verification (see Meta.Sealed). Never persisted.
+	EnginePending bool `json:"-"`
 }
 
 // KV is an ordered key/value pair for display.
@@ -245,4 +248,10 @@ type Meta struct {
 	// SkipVerify disables per-file OS signature verification (containers
 	// verify whole bundles instead).
 	SkipVerify bool
+	// Sealed: with SkipVerify, the file is inside an app bundle whose seal
+	// the container checks (codesign --deep). Its parsed signature still
+	// earns nothing by itself: the engine only marks the report
+	// EnginePending, and the container calls ConfirmBrowserEngine once the
+	// seal has verified. Loose files in a container are never pending.
+	Sealed bool
 }

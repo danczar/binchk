@@ -2,6 +2,7 @@ package analyze
 
 import (
 	"bytes"
+	"context"
 	"debug/macho"
 	"encoding/binary"
 	"fmt"
@@ -43,15 +44,19 @@ var riskyEntitlements = map[string]string{
 
 var platformNames = map[uint32]string{1: "macOS", 2: "iOS", 3: "tvOS", 4: "watchOS", 6: "Mac Catalyst", 7: "iOS Simulator", 11: "visionOS"}
 
-func analyzeMachO(data []byte, fat bool) (*formatResult, error) {
+func analyzeMachO(ctx context.Context, data []byte, fat bool) (*formatResult, error) {
 	res := &formatResult{}
+	bu := newFmtBudget(ctx, len(data))
 	if !fat {
 		f, err := macho.NewFile(bytes.NewReader(data))
 		if err != nil {
 			return nil, err
 		}
 		defer f.Close()
-		machoSlice(f, data, res)
+		if err := machoSlice(bu, f, data, res); err != nil {
+			return nil, err
+		}
+		bu.finish(res, max(len(f.Loads), len(f.Sections)))
 		return res, nil
 	}
 	ff, err := macho.NewFatFile(bytes.NewReader(data))
@@ -59,13 +64,18 @@ func analyzeMachO(data []byte, fat bool) (*formatResult, error) {
 		return nil, err
 	}
 	defer ff.Close()
+	most := 0
 	for _, a := range ff.Arches {
-		machoSlice(a.File, sub(data, uint64(a.Offset), uint64(a.Size)), res)
+		if err := machoSlice(bu, a.File, sub(data, uint64(a.Offset), uint64(a.Size)), res); err != nil {
+			return nil, err
+		}
+		most = max(most, len(a.Loads), len(a.Sections))
 	}
+	bu.finish(res, most)
 	return res, nil
 }
 
-func machoSlice(f *macho.File, data []byte, res *formatResult) {
+func machoSlice(bu *fmtBudget, f *macho.File, data []byte, res *formatResult) error {
 	add := func(id, title, detail string, sev Severity, ev ...string) {
 		res.findings = append(res.findings, Finding{ID: id, Title: title, Detail: detail, Severity: sev, Category: "structure", Evidence: ev})
 	}
@@ -102,18 +112,24 @@ func machoSlice(f *macho.File, data []byte, res *formatResult) {
 	for _, l := range f.Loads {
 		raw := l.Raw()
 		if seg, ok := l.(*macho.Segment); ok {
-			perms := permString(seg.Prot&1 != 0, seg.Prot&2 != 0, seg.Prot&4 != 0)
-			s := Section{Name: seg.Name, Offset: seg.Offset, Size: seg.Filesz, Addr: seg.Addr, Perms: perms}
-			if seg.Filesz > 0 {
-				s.Entropy = entropyOf(sub(data, seg.Offset, seg.Filesz))
-			}
-			sl.Segments = append(sl.Segments, s)
 			switch seg.Name {
 			case "__TEXT":
 				textAddr = seg.Addr
 			case "__PAGEZERO":
 				hasPageZero = true
 			}
+			if len(sl.Segments) >= maxSections {
+				continue
+			}
+			perms := permString(seg.Prot&1 != 0, seg.Prot&2 != 0, seg.Prot&4 != 0)
+			s := Section{Name: seg.Name, Offset: seg.Offset, Size: seg.Filesz, Addr: seg.Addr, Perms: perms}
+			if seg.Filesz > 0 {
+				var err error
+				if s.Entropy, err = bu.entropy(sub(data, seg.Offset, seg.Filesz)); err != nil {
+					return err
+				}
+			}
+			sl.Segments = append(sl.Segments, s)
 			if seg.Prot&7 == 7 {
 				add("macho-rwx-segment", "Segment is writable and executable", "", Medium, seg.Name)
 			}
@@ -195,17 +211,23 @@ func machoSlice(f *macho.File, data []byte, res *formatResult) {
 
 	for _, s := range f.Sections {
 		sec := Section{Name: s.Seg + "," + s.Name, Offset: uint64(s.Offset), Size: s.Size, Addr: s.Addr}
+		if sl.Entry != 0 && s.Addr <= sl.Entry && sl.Entry < s.Addr+s.Size {
+			sl.EntrySect = sec.Name
+		}
+		if len(sl.Sections) >= maxSections {
+			continue
+		}
 		if s.Flags&0xff != 1 && s.Offset != 0 { // skip S_ZEROFILL
-			sec.Entropy = entropyOf(sub(data, uint64(s.Offset), s.Size))
+			var err error
+			if sec.Entropy, err = bu.entropy(sub(data, uint64(s.Offset), s.Size)); err != nil {
+				return err
+			}
 		}
 		exec := s.Flags&0x80000400 != 0 // S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
 		if exec {
 			sec.Perms = "r-x"
 		}
 		sl.Sections = append(sl.Sections, sec)
-		if sl.Entry != 0 && s.Addr <= sl.Entry && sl.Entry < s.Addr+s.Size {
-			sl.EntrySect = sec.Name
-		}
 		if exec && s.Size > 4096 && sec.Entropy > 7.5 {
 			add("packed-code", "Encrypted or compressed code section", "", Medium, fmt.Sprintf("%s: %.2f bits/byte", sec.Name, sec.Entropy))
 		}
@@ -242,6 +264,7 @@ func machoSlice(f *macho.File, data []byte, res *formatResult) {
 		res.sig = sig
 	}
 	res.slices = append(res.slices, sl)
+	return nil
 }
 
 func checkDylibPath(p string, add func(id, title, detail string, sev Severity, ev ...string)) {

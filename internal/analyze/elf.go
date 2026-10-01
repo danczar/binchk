@@ -2,6 +2,7 @@ package analyze
 
 import (
 	"bytes"
+	"context"
 	"debug/elf"
 	"fmt"
 	"strings"
@@ -13,13 +14,14 @@ var knownInterpreters = []string{
 	"/usr/lib/ld.so", "/usr/lib/libc.so", "/lib/ld-uClibc", "/gnu/store/",
 }
 
-func analyzeELF(data []byte) (*formatResult, error) {
+func analyzeELF(ctx context.Context, data []byte) (*formatResult, error) {
 	f, err := elf.NewFile(bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 	res := &formatResult{}
+	bu := newFmtBudget(ctx, len(data))
 	add := func(id, title, detail string, sev Severity, ev ...string) {
 		res.findings = append(res.findings, Finding{ID: id, Title: title, Detail: detail, Severity: sev, Category: "structure", Evidence: ev})
 	}
@@ -47,10 +49,15 @@ func analyzeELF(data []byte) (*formatResult, error) {
 		case elf.PT_GNU_STACK:
 			execStack = p.Flags&elf.PF_X != 0
 		case elf.PT_LOAD:
+			if len(sl.Segments) >= maxSections {
+				continue
+			}
 			perms := permString(p.Flags&elf.PF_R != 0, p.Flags&elf.PF_W != 0, p.Flags&elf.PF_X != 0)
 			seg := Section{Name: "LOAD", Offset: p.Off, Size: p.Filesz, Addr: p.Vaddr, Perms: perms}
 			if b := sub(data, p.Off, p.Filesz); len(b) > 0 {
-				seg.Entropy = entropyOf(b)
+				if seg.Entropy, err = bu.entropy(b); err != nil {
+					return nil, err
+				}
 			}
 			sl.Segments = append(sl.Segments, seg)
 			if perms == "rwx" {
@@ -116,17 +123,22 @@ func analyzeELF(data []byte) (*formatResult, error) {
 		if s.Type == elf.SHT_SYMTAB {
 			hasSymtab = true
 		}
+		if s.Flags&elf.SHF_EXECINSTR != 0 && s.Addr <= f.Entry && f.Entry < s.Addr+s.Size {
+			sl.EntrySect = s.Name
+		}
+		if len(sl.Sections) >= maxSections {
+			continue
+		}
 		sec := Section{Name: s.Name, Offset: s.Offset, Size: s.Size, Addr: s.Addr,
 			Perms: permString(s.Flags&elf.SHF_ALLOC != 0, s.Flags&elf.SHF_WRITE != 0, s.Flags&elf.SHF_EXECINSTR != 0)}
 		if s.Type != elf.SHT_NOBITS {
 			if b := sub(data, s.Offset, s.Size); len(b) > 0 {
-				sec.Entropy = entropyOf(b)
+				if sec.Entropy, err = bu.entropy(b); err != nil {
+					return nil, err
+				}
 			}
 		}
 		sl.Sections = append(sl.Sections, sec)
-		if s.Flags&elf.SHF_EXECINSTR != 0 && s.Addr <= f.Entry && f.Entry < s.Addr+s.Size {
-			sl.EntrySect = s.Name
-		}
 	}
 	sl.Props["Symbols"] = map[bool]string{true: "present", false: "stripped"}[hasSymtab]
 	if f.Entry != 0 && f.Type != elf.ET_REL {
@@ -171,6 +183,7 @@ func analyzeELF(data []byte) (*formatResult, error) {
 			}
 		}
 	}
+	bu.finish(res, max(len(f.Progs), len(f.Sections)))
 	res.slices = []Slice{sl}
 	return res, nil
 }

@@ -2,6 +2,7 @@ package analyze
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"debug/pe"
 	"encoding/binary"
@@ -32,13 +33,14 @@ const (
 	scnWrite   = 0x80000000
 )
 
-func analyzePE(data []byte) (*formatResult, error) {
+func analyzePE(ctx context.Context, data []byte) (*formatResult, error) {
 	f, err := pe.NewFile(bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 	res := &formatResult{}
+	bu := newFmtBudget(ctx, len(data))
 	add := func(id, title, detail string, sev Severity, ev ...string) {
 		res.findings = append(res.findings, Finding{ID: id, Title: title, Detail: detail, Severity: sev, Category: "structure", Evidence: ev})
 	}
@@ -102,12 +104,6 @@ func analyzePE(data []byte) (*formatResult, error) {
 	var lastEnd uint64
 	var entrySect *pe.Section
 	for i, s := range f.Sections {
-		perms := permString(s.Characteristics&scnRead != 0, s.Characteristics&scnWrite != 0, s.Characteristics&scnExecute != 0)
-		sec := Section{Name: s.Name, Offset: uint64(s.Offset), Size: uint64(s.Size), Addr: uint64(s.VirtualAddress), Perms: perms}
-		if raw := sub(data, uint64(s.Offset), uint64(s.Size)); len(raw) > 0 {
-			sec.Entropy = entropyOf(raw)
-		}
-		sl.Sections = append(sl.Sections, sec)
 		if s.Size > 0 && uint64(s.Offset)+uint64(s.Size) > lastEnd {
 			lastEnd = uint64(s.Offset) + uint64(s.Size)
 		}
@@ -115,6 +111,17 @@ func analyzePE(data []byte) (*formatResult, error) {
 		if entry >= s.VirtualAddress && entry < s.VirtualAddress+vsize {
 			entrySect = f.Sections[i]
 		}
+		if i >= maxSections {
+			continue
+		}
+		perms := permString(s.Characteristics&scnRead != 0, s.Characteristics&scnWrite != 0, s.Characteristics&scnExecute != 0)
+		sec := Section{Name: s.Name, Offset: uint64(s.Offset), Size: uint64(s.Size), Addr: uint64(s.VirtualAddress), Perms: perms}
+		if raw := sub(data, uint64(s.Offset), uint64(s.Size)); len(raw) > 0 {
+			if sec.Entropy, err = bu.entropy(raw); err != nil {
+				return nil, err
+			}
+		}
+		sl.Sections = append(sl.Sections, sec)
 		exec := s.Characteristics&(scnExecute|scnCode) != 0
 		if exec && s.Characteristics&scnWrite != 0 {
 			add("pe-wx-section", "Writable and executable section", "Self-modifying or unpacking code needs W+X memory; normal compilers never emit it.", Medium, s.Name)
@@ -142,8 +149,16 @@ func analyzePE(data []byte) (*formatResult, error) {
 		add("entry-outside", "Entry point lies outside every section", "", High, fmt.Sprintf("RVA 0x%x", entry))
 	}
 
+	bu.finish(res, len(f.Sections))
+
 	// Imports
-	syms, _ := f.ImportedSymbols()
+	syms, anomaly, err := peImports(ctx, f, data)
+	if err != nil {
+		return nil, err
+	}
+	if anomaly != "" {
+		add("pe-import-anomaly", "Import table exceeds sane limits", "Only part of the import table was read; tables this large are crafted to stall analysis tools.", Medium, anomaly)
+	}
 	libSeen := map[string]bool{}
 	var imphash strings.Builder
 	for _, s := range syms {
@@ -243,6 +258,103 @@ func analyzePE(data []byte) (*formatResult, error) {
 	}
 	res.slices = []Slice{sl}
 	return res, nil
+}
+
+// peImports returns the same "name:dll" list as debug/pe's ImportedSymbols,
+// which copies the whole import section once per descriptor and so goes
+// quadratic on crafted tables. This walk reads the mapped file in place,
+// bounds names and stops at maxImportDescs / maxImportThunks; anomaly says
+// which limit was hit.
+func peImports(ctx context.Context, f *pe.File, data []byte) (syms []string, anomaly string, err error) {
+	var idd pe.DataDirectory
+	pe64 := false
+	switch oh := f.OptionalHeader.(type) {
+	case *pe.OptionalHeader32:
+		if oh.NumberOfRvaAndSizes <= pe.IMAGE_DIRECTORY_ENTRY_IMPORT {
+			return nil, "", nil
+		}
+		idd = oh.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_IMPORT]
+	case *pe.OptionalHeader64:
+		if oh.NumberOfRvaAndSizes <= pe.IMAGE_DIRECTORY_ENTRY_IMPORT {
+			return nil, "", nil
+		}
+		idd, pe64 = oh.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_IMPORT], true
+	default:
+		return nil, "", nil
+	}
+	var ds *pe.Section
+	for _, s := range f.Sections {
+		if s.Offset != 0 && s.VirtualAddress <= idd.VirtualAddress && idd.VirtualAddress-s.VirtualAddress < s.VirtualSize {
+			ds = s
+			break
+		}
+	}
+	if ds == nil {
+		return nil, "", nil
+	}
+	sec := sub(data, uint64(ds.Offset), uint64(ds.Size))
+	if uint64(len(sec)) < uint64(ds.Size) {
+		return nil, "", nil // debug/pe cannot read a truncated section either
+	}
+	name := func(off uint32) string {
+		if uint64(off) >= uint64(len(sec)) {
+			return ""
+		}
+		b := sec[off:min(uint64(off)+maxImportNameLen, uint64(len(sec)))]
+		if n := bytes.IndexByte(b, 0); n >= 0 {
+			return string(b[:n])
+		}
+		return ""
+	}
+	seek := idd.VirtualAddress - ds.VirtualAddress
+	if seek >= uint32(len(sec)) {
+		return nil, "", nil
+	}
+	thunks := 0
+	for d, n := sec[seek:], 0; len(d) >= 20; d, n = d[20:], n+1 {
+		oft, dllRVA := binary.LittleEndian.Uint32(d[0:]), binary.LittleEndian.Uint32(d[12:])
+		if oft == 0 {
+			break
+		}
+		if n == maxImportDescs {
+			return syms, fmt.Sprintf("more than %d import descriptors", maxImportDescs), nil
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
+		dll := name(dllRVA - ds.VirtualAddress)
+		off := oft - ds.VirtualAddress
+		if off >= uint32(len(sec)) {
+			break
+		}
+		for t := sec[off:]; ; {
+			var va uint64
+			var ordinal bool
+			if pe64 {
+				if len(t) < 8 {
+					break
+				}
+				va, t = binary.LittleEndian.Uint64(t), t[8:]
+				ordinal = va&(1<<63) != 0
+			} else {
+				if len(t) <= 4 {
+					break
+				}
+				va, t = uint64(binary.LittleEndian.Uint32(t)), t[4:]
+				ordinal = va&(1<<31) != 0
+			}
+			if va == 0 {
+				break
+			}
+			if thunks++; thunks > maxImportThunks {
+				return syms, fmt.Sprintf("more than %d imported functions", maxImportThunks), nil
+			}
+			if !ordinal {
+				syms = append(syms, name(uint32(va)-ds.VirtualAddress+2)+":"+dll)
+			}
+		}
+	}
+	return syms, "", nil
 }
 
 func rvaToOffset(f *pe.File, rva uint32) (uint64, bool) {

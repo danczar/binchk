@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -257,5 +259,156 @@ func TestPBZXHonoursContext(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("pbzx Read ignored the context")
+	}
+}
+
+// assertConfined fails t if any symlink under dir resolves outside it.
+func assertConfined(t *testing.T, dir string) {
+	t.Helper()
+	rootReal, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.Type()&os.ModeSymlink == 0 {
+			return nil
+		}
+		r, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			return nil // dangling or looping: cannot be followed anywhere
+		}
+		if rel, err := filepath.Rel(rootReal, r); err != nil || !filepath.IsLocal(rel) && rel != "." {
+			t.Errorf("%s resolves outside %s: %s", p, dir, r)
+		}
+		return nil
+	})
+}
+
+// cpio builds an odc archive from entries, adding the trailer.
+func cpio(entries ...[]byte) *bytes.Buffer {
+	var b bytes.Buffer
+	for _, e := range entries {
+		b.Write(e)
+	}
+	b.Write(odc("TRAILER!!!", 0, nil))
+	return &b
+}
+
+// A second extraction into the same directory must not turn a link the
+// first one kept (lexically in-root through a missing component) into an
+// escape: every link in the final tree is re-checked, not just new ones.
+func TestExtractCPIOSameDirTwice(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "x")
+	deep := strings.Repeat("u/", 12) + strings.Repeat("../", 12)
+	first := cpio(odc("./v", 0o120777, []byte(deep)), odc("./ok", 0o120777, []byte("u")))
+	if _, err := ExtractCPIO(context.Background(), first, dir, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "v")); err != nil {
+		t.Fatalf("in-root link v was dropped by the first extraction: %v", err)
+	}
+	second := cpio(odc("./u", 0o120777, []byte(".")))
+	if _, err := ExtractCPIO(context.Background(), second, dir, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	assertConfined(t, dir)
+	if _, err := os.Lstat(filepath.Join(dir, "v")); err == nil {
+		t.Error("link v, now escaping through u, was kept")
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "ok")); err != nil {
+		t.Errorf("harmless link ok was removed: %v", err)
+	}
+}
+
+// Targets carrying the other platform's separator: on Windows "\" splits
+// components (and a leading one is rooted); elsewhere it is part of a
+// file name. Either way nothing may resolve outside the root.
+func TestExtractCPIOBackslashTargets(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "x")
+	arc := cpio(
+		odc("./q", 0o120777, []byte(".")),
+		odc("./a/b1", 0o120777, []byte(`..\..\..\etc`)),
+		odc("./a/b2", 0o120777, []byte(`q\..\..`)),
+		odc("./a/b3", 0o120777, []byte(`\etc\passwd`)),
+		odc("./a/b4", 0o120777, []byte(`C:\Windows`)),
+		odc("./a/b5", 0o120777, []byte(`..\q\..\..`)),
+		odc("./a/b6", 0o120777, []byte(`../q\../..`)),
+		odc("./a/b7", 0o120777, []byte(`..\..`)),
+	)
+	if _, err := ExtractCPIO(context.Background(), arc, dir, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	assertConfined(t, dir)
+	want := map[string]bool{ // kept?
+		"a/b1": runtime.GOOS != "windows", // one odd file name elsewhere
+		"a/b3": runtime.GOOS != "windows",
+		"a/b4": runtime.GOOS != "windows",
+		"a/b6": runtime.GOOS != "windows", // ../ then a name "q\.." then ..
+		"a/b7": runtime.GOOS != "windows",
+	}
+	for l, keep := range want {
+		_, err := os.Lstat(filepath.Join(dir, l))
+		if kept := err == nil; kept != keep {
+			t.Errorf("link %s kept = %v, want %v", l, kept, keep)
+		}
+	}
+}
+
+// A link needing more hops than the kernel follows is refused (fails
+// closed) while a chain within the limit is kept.
+func TestExtractCPIOHopLimit(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "x")
+	// c0 -> f, cN -> c(N-1): resolving cN's target takes N hops.
+	es := [][]byte{odc("./f", 0o100644, []byte("data")), odc("./c0", 0o120777, []byte("f"))}
+	for i := 1; i <= maxLinkHops+2; i++ {
+		es = append(es, odc(fmt.Sprintf("./c%d", i), 0o120777, []byte(fmt.Sprintf("c%d", i-1))))
+	}
+	if _, err := ExtractCPIO(context.Background(), cpio(es...), dir, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	assertConfined(t, dir)
+	// Opening cI follows I+1 links; the kernel stops at maxLinkHops.
+	for i := 0; i <= maxLinkHops+1; i++ {
+		c := filepath.Join(dir, fmt.Sprintf("c%d", i))
+		_, err := os.Lstat(c)
+		if kept, keep := err == nil, i+1 <= maxLinkHops; kept != keep {
+			t.Errorf("c%d kept = %v, want %v", i, kept, keep)
+		}
+		if i == 9 { // kept links work; near the limit the kernel may stop sooner
+			if b, err := os.ReadFile(c); err != nil || string(b) != "data" {
+				t.Errorf("chain of %d links: %q %v", i+1, b, err)
+			}
+		}
+	}
+	// The next link points at a refused one: it stays, dangling.
+	if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf("c%d", maxLinkHops+2))); err == nil {
+		t.Errorf("c%d resolves", maxLinkHops+2)
+	}
+}
+
+// Once the resolution budget is spent, remaining links are refused and
+// kept ones dropped, but regular files are still extracted and nothing
+// escapes. Each link below costs about 2000 components per check.
+func TestExtractCPIOLinkBudgetExhausted(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "x")
+	long := []byte(strings.Repeat("./", 2000) + "f")
+	n := linkBudget/2000 + 10
+	es := [][]byte{odc("./f", 0o100644, []byte("data"))}
+	for i := 0; i < n; i++ {
+		es = append(es, odc(fmt.Sprintf("./l%d", i), 0o120777, long))
+	}
+	es = append(es, odc("./q", 0o120777, []byte(".")), odc("./esc", 0o120777, []byte("q/..")))
+	es = append(es, odc("./late", 0o100644, []byte("late")))
+	if _, err := ExtractCPIO(context.Background(), cpio(es...), dir, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	assertConfined(t, dir)
+	if b, err := os.ReadFile(filepath.Join(dir, "late")); err != nil || string(b) != "late" {
+		t.Errorf("regular file after budget exhaustion: %q %v", b, err)
+	}
+	for _, l := range []string{"l0", fmt.Sprintf("l%d", n-1), "q", "esc"} {
+		if _, err := os.Lstat(filepath.Join(dir, l)); err == nil {
+			t.Errorf("link %s kept although the budget ran out", l)
+		}
 	}
 }

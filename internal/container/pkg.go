@@ -4,8 +4,10 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -89,13 +91,9 @@ func (in *inspector) inspectPkg(abs, rel string, top bool) {
 	in.goTask(func() {
 		defer a.Close()
 		var payloadNotes []string
-		for _, e := range a.Entries {
-			base := filepath.Base(e.Path)
-			if base != "Scripts" && base != "Payload" || e.Type != "file" {
-				continue
-			}
-			comp := strings.TrimSuffix(filepath.Dir(e.Path), ".")
-			dst := filepath.Join(tmp, "x", comp, base)
+		for _, p := range payloadParts(tmp, a.Entries) {
+			e, dst := p.e, p.dst
+			base := path.Base(e.Path)
 			t0 := time.Now()
 			n, err := extract(in, a, e, dst, base == "Payload")
 			in.timed("extract "+filepath.Join(rel, e.Path), t0, err)
@@ -193,6 +191,31 @@ func fillCert(sig *analyze.Signature, a *xar.Archive) {
 	} else if m := reTeam.FindStringSubmatch(sig.Signer); m != nil {
 		sig.TeamID = m[1]
 	}
+}
+
+// part is a Scripts or Payload stream and the directory it extracts into.
+type part struct {
+	e   xar.Entry
+	dst string
+}
+
+// payloadParts lists the Scripts and Payload streams of entries, each with
+// a fresh directory of its own directly under tmp/x. The directory is
+// named by position, never derived from the entry's path, so a hostile
+// table of contents (duplicate, nested or ".." names) can neither make
+// two extractions share or nest trees, where one's links could make the
+// other's escape, nor place one outside tmp.
+func payloadParts(tmp string, entries []xar.Entry) []part {
+	var ps []part
+	for _, e := range entries {
+		base := path.Base(e.Path)
+		if base != "Scripts" && base != "Payload" || e.Type != "file" {
+			continue
+		}
+		dst := filepath.Join(tmp, "x", strconv.Itoa(len(ps))+"-"+base)
+		ps = append(ps, part{e, dst})
+	}
+	return ps
 }
 
 // extract decompresses a Scripts or Payload stream into dst.

@@ -38,8 +38,8 @@ func ExtractCPIO(ctx context.Context, r io.Reader, dir string, lim Limits) (int6
 	defer root.Close()
 	// No link left behind may resolve outside dir, whatever the outcome.
 	// Links are checked against the real tree as they are created, and
-	// again once it is final, because a later entry can change how an
-	// earlier link resolves.
+	// every link under dir is checked again once it is final, because a
+	// later entry can change how an earlier link resolves.
 	links := &linkGuard{root: root, budget: linkBudget}
 	defer links.prune()
 	r = ctxReader{ctx, r}
@@ -78,9 +78,8 @@ func ExtractCPIO(ctx context.Context, r io.Reader, dir string, lim Limits) (int6
 			// stands (existing links included), stays inside the root.
 			t := string(target)
 			if !isAbsLink(t) && mkdirs(root, filepath.Dir(rel), dirs) &&
-				links.inRoot(append(splitPath(filepath.Dir(rel)), splitPath(t)...)) &&
-				root.Symlink(t, rel) == nil {
-				links.made = append(links.made, rel)
+				links.inRoot(append(splitPath(filepath.Dir(rel)), splitPath(t)...)) {
+				root.Symlink(t, rel)
 			}
 		case mode == 0o100000:
 			if !mkdirs(root, filepath.Dir(rel), dirs) {
@@ -137,15 +136,25 @@ const maxLinkHops = 32
 type linkGuard struct {
 	root   *os.Root
 	budget int
-	made   []string // links created, root-relative
 }
 
-// prune removes every created link that, in the final tree, resolves
-// outside the root. inRoot rejects a path whose resolution leaves the root
-// at any step, so removing a link can only make others dangle (a missing
-// component fails resolution), never escape: one pass suffices.
+// prune removes every link in the final tree under the root that resolves
+// outside it: not only the links this extraction made, because the
+// directory may already hold links (an earlier extraction into it) whose
+// resolution the new entries change. inRoot rejects a path whose
+// resolution leaves the root at any step, so removing a link can only make
+// others dangle (the kernel fails on a missing component), never escape:
+// one pass suffices.
 func (g *linkGuard) prune() {
-	for _, l := range g.made {
+	var links []string
+	fs.WalkDir(g.root.FS(), ".", func(p string, d fs.DirEntry, err error) error {
+		// WalkDir does not descend into linked directories.
+		if err == nil && d.Type()&fs.ModeSymlink != 0 {
+			links = append(links, filepath.FromSlash(p))
+		}
+		return nil
+	})
+	for _, l := range links {
 		if !g.inRoot(splitPath(l)) {
 			g.root.Remove(l)
 		}

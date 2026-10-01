@@ -76,9 +76,9 @@ func detach(dev string) {
 	}
 }
 
-// inspectDMG mounts and walks the image at path. rescan analyses its bytes
-// as a plain file when it will not mount (callers that already did pass false).
-func (in *inspector) inspectDMG(path string, rescan bool) {
+// inspectDMG mounts and walks the image at path. Callers analyse the image
+// file's own bytes separately (analyzeSelf), mounted or not.
+func (in *inspector) inspectDMG(path string) {
 	// The image file's own Gatekeeper verdict: ~0.2 s, reads no contents,
 	// and tells us whether the vendor signed and notarized the download.
 	// It is the trust fallback when a huge app cannot be verified in time.
@@ -134,11 +134,6 @@ func (in *inspector) inspectDMG(path string, rescan bool) {
 		default:
 			in.add(analyze.Finding{ID: "dmg-unreadable", Title: "Disk image could not be opened",
 				Severity: analyze.Low, Category: "structure", Evidence: []string{msg}})
-			// Not really an image, perhaps: scan its bytes as a plain file
-			// rather than let a forged trailer hide them.
-			if rescan {
-				in.analyzeSelf(path, filepath.Base(path), "image")
-			}
 		}
 		return
 	}

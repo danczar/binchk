@@ -1,6 +1,7 @@
 package container
 
 import (
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -19,9 +20,9 @@ func hasShebang(p string) bool {
 		return false
 	}
 	defer f.Close()
-	var b [2]byte
-	n, _ := f.Read(b[:])
-	return n == 2 && b[0] == '#' && b[1] == '!'
+	var b [5]byte
+	n, _ := io.ReadFull(f, b[:])
+	return detect.HasShebang(b[:n])
 }
 
 // addBundle registers a bundle whose properties are filled in as checks

@@ -2,6 +2,7 @@
 package detect
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 	"os"
@@ -66,32 +67,44 @@ func Sniff(r io.ReaderAt, size int64) Format {
 	}
 	// A script with a trailer is still a DiskImage here (so watchers pick
 	// it up); callers check UDIFPolyglot to inspect its leading side too.
-	if HasUDIFTrailer(r, size) {
+	if HasUDIFTrailer(r, size) || hasUDIFHeader(r, size) {
 		return DiskImage
 	}
 	return Unknown
 }
 
-// HasUDIFTrailer reports whether the file ends with a plausible UDIF "koly"
-// trailer: signature, a version, the 512-byte header size, and data fork and
-// XML plist ranges that lie inside the file before the trailer.
+// HasUDIFTrailer reports whether the file ends with a UDIF "koly" trailer
+// hdiutil would accept. Only what hdiutil itself checks is required: the
+// signature, a nonzero version and an XML plist range inside the file.
+// hdiutil ignores the header size and the data fork length (it mounts
+// images with a header size of 0 or 0x400, or a data fork length past the
+// end of the file), so neither may be used to reject a trailer.
 func HasUDIFTrailer(r io.ReaderAt, size int64) bool {
-	if size < 1024 {
+	return kolyAt(r, size, size-512)
+}
+
+// hasUDIFHeader reports whether the file starts with a koly block, which
+// hdiutil also accepts (its offsets then count from the file start too).
+func hasUDIFHeader(r io.ReaderAt, size int64) bool {
+	return kolyAt(r, size, 0)
+}
+
+// kolyAt reports whether a koly block hdiutil accepts sits at offset at.
+func kolyAt(r io.ReaderAt, size, at int64) bool {
+	if size < 512 || at < 0 {
 		return false
 	}
 	var k [512]byte
-	if _, err := r.ReadAt(k[:], size-512); err != nil {
+	if _, err := r.ReadAt(k[:], at); err != nil {
 		return false
 	}
-	if string(k[:4]) != "koly" || binary.BigEndian.Uint32(k[4:8]) == 0 || binary.BigEndian.Uint32(k[8:12]) != 512 {
+	if string(k[:4]) != "koly" || binary.BigEndian.Uint32(k[4:8]) == 0 {
 		return false
 	}
-	end := uint64(size - 512)
-	inside := func(at int) bool {
-		off, n := binary.BigEndian.Uint64(k[at:]), binary.BigEndian.Uint64(k[at+8:])
-		return off <= end && n <= end-off
-	}
-	return inside(0x18) && inside(0xD8) // data fork, XML plist
+	// The plist may run into the trailer itself: hdiutil reads up to EOF.
+	off, n := binary.BigEndian.Uint64(k[0xD8:]), binary.BigEndian.Uint64(k[0xE0:])
+	end := uint64(size)
+	return off <= end && n <= end-off
 }
 
 // SniffLeading classifies a file by its leading bytes alone, ignoring any
@@ -105,18 +118,27 @@ func SniffLeading(r io.ReaderAt, size int64) Format {
 	return sniffMagic(r, h[:n], size)
 }
 
+// HasShebang reports whether h starts with "#!", optionally after a UTF-8
+// byte order mark (a shell still runs such a file as a script).
+func HasShebang(h []byte) bool {
+	h = bytes.TrimPrefix(h, []byte("\xef\xbb\xbf"))
+	return len(h) >= 2 && h[0] == '#' && h[1] == '!'
+}
+
 // UDIFPolyglot reports whether the file ends with a valid UDIF trailer but
 // starts with something other than the image's own data: executable or
 // container magic, a "#!" script, or any bytes before the data fork. Such a
 // file both mounts and runs (or opens as the other format), so both sides
 // must be inspected. Images hdiutil writes start their data fork at 0 with
-// none of those signatures.
+// none of those signatures. A plain image is not a polyglot here, but its
+// own bytes still need scanning: a raw image's leading sectors are the
+// author's to fill, and a shell runs text there even without "#!".
 func UDIFPolyglot(r io.ReaderAt, size int64) bool {
 	if !HasUDIFTrailer(r, size) {
 		return false
 	}
-	var h [2]byte
-	if n, _ := r.ReadAt(h[:], 0); n == 2 && h[0] == '#' && h[1] == '!' {
+	var h [5]byte
+	if n, _ := r.ReadAt(h[:], 0); HasShebang(h[:n]) {
 		return true
 	}
 	if SniffLeading(r, size) != Unknown {

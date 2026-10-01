@@ -111,8 +111,8 @@ func TestDMGWithSuspiciousApp(t *testing.T) {
 	if len(r.Container.Bundles) != 1 || r.Container.Bundles[0].Path != "Installer.app" {
 		t.Errorf("bundles: %+v", r.Container.Bundles)
 	}
-	if len(r.Container.Files) != 3 {
-		t.Errorf("files: %d, want app exe + script + helper", len(r.Container.Files))
+	if len(r.Container.Files) != 4 {
+		t.Errorf("files: %d, want the image itself + app exe + script + helper", len(r.Container.Files))
 	}
 	if r.Hashes.SHA256 == "" {
 		t.Error("container not hashed")

@@ -162,9 +162,13 @@ func analyzeContainer(parent context.Context, eng *analyze.Engine, path string, 
 		if f == detect.InstallerPkg {
 			in.inspectPkg(path, r.FileName, true)
 		}
-		in.inspectDMG(path, false)
+		in.inspectDMG(path)
 	case f == detect.DiskImage:
-		in.inspectDMG(path, true)
+		// The image file's own bytes are always analysed too, mounted or
+		// not: a forged trailer may hide a plain file, and a raw image's
+		// leading sectors are the author's to fill with text a shell runs.
+		in.analyzeSelf(path, r.FileName, "image")
+		in.inspectDMG(path)
 	case f == detect.InstallerPkg:
 		in.inspectPkg(path, r.FileName, true)
 	case f == detect.AppBundle:

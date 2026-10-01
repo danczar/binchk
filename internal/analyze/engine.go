@@ -132,7 +132,7 @@ func (e *Engine) AnalyzeWait(parent context.Context, path string, meta Meta) (*R
 	r.Format = string(format)
 	if format == detect.Unknown {
 		r.Format = "unknown"
-		if len(data) > 2 && data[0] == '#' && data[1] == '!' {
+		if detect.HasShebang(data[:min(len(data), 5)]) {
 			r.Format = "script"
 		}
 	}
@@ -416,8 +416,10 @@ func (e *Engine) correlate(s *session, format detect.Format) {
 		for _, sl := range r.Slices {
 			imports = max(imports, len(sl.Imports))
 		}
+		// Disk images are compressed (or encrypted) by design; their own
+		// bytes are scanned for what could run, not for packing.
 		switch {
-		case installer || hasNote(r.Toolchain.Notes, "PyInstaller") || hasNote(r.Toolchain.Notes, "Nuitka"):
+		case installer || format == detect.DiskImage || hasNote(r.Toolchain.Notes, "PyInstaller") || hasNote(r.Toolchain.Notes, "Nuitka"):
 			sev = Info
 		case imports >= 20:
 			// A real import table means the code itself is not packed;

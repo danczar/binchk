@@ -32,4 +32,4 @@ func pkgSignature(ctx context.Context, p string) (pkgSig, error) { return pkgSig
 
 func readPlist(ctx context.Context, p string) (map[string]string, error) { return readXMLPlist(p) }
 
-func (in *inspector) inspectDMG(path string, rescan bool) {}
+func (in *inspector) inspectDMG(path string) {}

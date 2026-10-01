@@ -5,6 +5,7 @@ set -eu
 BIN=${1:?usage: $0 path/to/binchk [version]}
 VERSION=${2:-dev}
 VERSION=${VERSION#v}   # Apple wants 0.1.0, not v0.1.0
+MACOS_MIN=${MACOS_MIN:-13.0}   # must match the binary's minos (Makefile)
 APP=dist/binchk.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -23,7 +24,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSUIElement</key><true/>
-  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>LSMinimumSystemVersion</key><string>${MACOS_MIN}</string>
 </dict>
 </plist>
 PLIST

@@ -204,7 +204,7 @@ func TestSelfIsClean(t *testing.T) {
 	}
 	// binchk must not flag itself: its signatures are embedded compressed.
 	path := filepath.Join(t.TempDir(), "binchk")
-	cmd := exec.Command("go", "build", "-o", path, "github.com/danczar/binchk/cmd/binchk")
+	cmd := exec.Command("go", "build", "-trimpath", "-o", path, "github.com/danczar/binchk/cmd/binchk")
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux")
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("%v\n%s", err, b)

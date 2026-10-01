@@ -3,11 +3,14 @@ package xar
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // odc builds a cpio (odc) entry.
@@ -53,6 +56,65 @@ func TestExtractCPIOIsConfined(t *testing.T) {
 	big.Write(odc("TRAILER!!!", 0, nil))
 	if _, err := ExtractCPIO(context.Background(), &big, t.TempDir(), Limits{MaxBytes: 1024}); err == nil {
 		t.Fatal("expected limit error")
+	}
+}
+
+// A chain of symlinks that each pass the lexical in-root check must not let a
+// later entry write outside the extraction root.
+func TestExtractCPIOSymlinkChain(t *testing.T) {
+	var arc bytes.Buffer
+	arc.Write(odc("./a/b", 0o040755, nil))
+	arc.Write(odc("./a/b/l", 0o120777, []byte("..")))      // -> a
+	arc.Write(odc("./a/b/l/m", 0o120777, []byte("../.."))) // really a/m -> outside
+	arc.Write(odc("./a/b/l/m/escape.txt", 0o100644, []byte("pwned")))
+	arc.Write(odc("./a/b/l/m/sub", 0o040755, nil))
+	arc.Write(odc("./fw/Versions/A/Fw", 0o100644, []byte("lib")))
+	arc.Write(odc("./fw/Versions/Current", 0o120777, []byte("A")))
+	arc.Write(odc("./fw/Fw", 0o120777, []byte("Versions/Current/Fw")))
+	arc.Write(odc("TRAILER!!!", 0, nil))
+	base := t.TempDir()
+	dir := filepath.Join(base, "x")
+	ExtractCPIO(context.Background(), &arc, dir, Limits{MaxBytes: 1 << 20})
+	for _, p := range []string{"escape.txt", "sub"} {
+		if _, err := os.Lstat(filepath.Join(base, p)); err == nil {
+			t.Errorf("%s was written outside the extraction root", p)
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "fw/Fw")); err != nil || string(b) != "lib" {
+		t.Errorf("in-root framework symlinks: %q %v", b, err)
+	}
+}
+
+// slowZeros yields zeros slowly, standing in for a decompression bomb.
+type slowZeros struct{}
+
+func (slowZeros) Read(p []byte) (int, error) {
+	time.Sleep(time.Millisecond)
+	clear(p)
+	return len(p), nil
+}
+
+// A huge non-regular entry is drained under the deadline and the byte budget.
+func TestExtractCPIOBodyBounded(t *testing.T) {
+	bomb := func() io.Reader {
+		var h bytes.Buffer
+		fmt.Fprintf(&h, "070707%06o%06o%06o%06o%06o%06o%06o%011o%06o%011o", 0, 0, 0o020644, 0, 0, 1, 0, 0, 4, int64(1)<<32)
+		h.WriteString("dev\x00")
+		return io.MultiReader(&h, slowZeros{})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	t0 := time.Now()
+	if _, err := ExtractCPIO(ctx, bomb(), t.TempDir(), Limits{}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want deadline exceeded", err)
+	}
+	if d := time.Since(t0); d > time.Second {
+		t.Errorf("returned after %v", d)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := ExtractCPIO(ctx, bomb(), t.TempDir(), Limits{MaxBytes: 1 << 20}); !errors.Is(err, ErrLimit) {
+		t.Errorf("err = %v, want ErrLimit", err)
 	}
 }
 

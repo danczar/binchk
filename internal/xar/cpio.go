@@ -14,7 +14,7 @@ import (
 
 // Limits bounds an extraction.
 type Limits struct {
-	MaxBytes   int64 // total bytes written
+	MaxBytes   int64 // total entry body bytes, written or skipped
 	MaxEntries int
 }
 
@@ -23,14 +23,23 @@ type Limits struct {
 var ErrLimit = errors.New("extraction limit reached")
 
 // ExtractCPIO unpacks an odc ("070707") or newc ("070701") cpio stream into
-// dir. It returns the number of bytes written.
+// dir. It returns the number of bytes written. Every body byte read, written
+// or discarded, counts toward lim.MaxBytes, and ctx is honoured mid-entry.
 func ExtractCPIO(ctx context.Context, r io.Reader, dir string, lim Limits) (int64, error) {
-	root, err := filepath.Abs(dir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return 0, err
+	}
+	// All writes go through root, which refuses any path that resolves
+	// outside dir however the archive's symlinks are arranged.
+	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return 0, err
 	}
-	var written int64
+	defer root.Close()
+	r = ctxReader{ctx, r}
+	var written, consumed int64
 	entries := 0
+	dirs := map[string]bool{} // directories verified to be real (not links)
 	for {
 		if err := ctx.Err(); err != nil {
 			return written, err
@@ -46,30 +55,33 @@ func ExtractCPIO(ctx context.Context, r io.Reader, dir string, lim Limits) (int6
 		if lim.MaxEntries > 0 && entries > lim.MaxEntries {
 			return written, fmt.Errorf("%w: more than %d entries", ErrLimit, lim.MaxEntries)
 		}
+		if lim.MaxBytes > 0 && consumed+h.size > lim.MaxBytes {
+			return written, fmt.Errorf("%w: %d bytes", ErrLimit, lim.MaxBytes)
+		}
+		consumed += h.size
 		body := io.LimitReader(r, h.size)
-		dst, ok := safeJoin(root, h.name)
+		rel, ok := cleanName(h.name)
 		mode := h.mode & 0o170000
 		switch {
-		case !ok || h.name == "." || h.name == "":
+		case !ok:
 		case mode == 0o040000:
-			os.MkdirAll(dst, 0o755)
+			mkdirs(root, rel, dirs)
 		case mode == 0o120000 && h.size < 4096:
 			target, _ := io.ReadAll(body)
-			// Only links that resolve inside the extraction root.
+			// Only links that resolve inside the extraction root. The parent
+			// holds no symlinks (mkdirs), so the lexical check is exact.
 			t := string(target)
-			relDir, _ := filepath.Rel(root, filepath.Dir(dst))
-			resolved := filepath.Clean(filepath.Join(relDir, t))
-			if !filepath.IsAbs(t) && resolved != ".." && !strings.HasPrefix(resolved, ".."+string(filepath.Separator)) {
-				os.MkdirAll(filepath.Dir(dst), 0o755)
-				os.Symlink(t, dst)
+			resolved := filepath.Clean(filepath.Join(filepath.Dir(rel), t))
+			if !filepath.IsAbs(t) && resolved != ".." && !strings.HasPrefix(resolved, ".."+string(filepath.Separator)) &&
+				mkdirs(root, filepath.Dir(rel), dirs) {
+				root.Symlink(t, rel)
 			}
 		case mode == 0o100000:
-			if lim.MaxBytes > 0 && written+h.size > lim.MaxBytes {
-				return written, fmt.Errorf("%w: %d bytes", ErrLimit, lim.MaxBytes)
+			if !mkdirs(root, filepath.Dir(rel), dirs) {
+				break
 			}
-			os.MkdirAll(filepath.Dir(dst), 0o755)
 			perm := fs.FileMode(h.mode&0o777) | 0o600 // no setuid/setgid/sticky
-			f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+			f, err := root.OpenFile(rel, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
 			if err == nil {
 				n, cerr := io.Copy(f, body)
 				f.Close()
@@ -89,6 +101,41 @@ func ExtractCPIO(ctx context.Context, r io.Reader, dir string, lim Limits) (int6
 			}
 		}
 	}
+}
+
+// ctxReader fails reads once ctx is done, so a single huge entry cannot
+// outlive the deadline.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
+// mkdirs creates dir (relative to root) and its parents, reporting false if
+// any component is an existing symlink or non-directory: later entries are
+// never written through a link, even one that stays inside root.
+func mkdirs(root *os.Root, dir string, seen map[string]bool) bool {
+	if dir == "." || seen[dir] {
+		return true
+	}
+	if !mkdirs(root, filepath.Dir(dir), seen) {
+		return false
+	}
+	if fi, err := root.Lstat(dir); err != nil {
+		if root.Mkdir(dir, 0o755) != nil {
+			return false
+		}
+	} else if !fi.IsDir() {
+		return false
+	}
+	seen[dir] = true
+	return true
 }
 
 type header struct {
@@ -145,12 +192,10 @@ func readHeader(r io.Reader) (*header, error) {
 	return nil, fmt.Errorf("cpio: unknown magic %q", magic)
 }
 
-// safeJoin resolves name under root, refusing anything that escapes it.
-func safeJoin(root, name string) (string, bool) {
+// cleanName turns an archive name into a root-relative path, dropping any
+// leading "/" or "..". It reports false for the root itself.
+func cleanName(name string) (string, bool) {
 	clean := filepath.Clean("/" + filepath.FromSlash(name))
-	p := filepath.Join(root, clean)
-	if p != root && !strings.HasPrefix(p, root+string(filepath.Separator)) {
-		return "", false
-	}
-	return p, true
+	rel := strings.TrimLeft(clean, string(filepath.Separator))
+	return rel, rel != "" && filepath.IsLocal(rel)
 }

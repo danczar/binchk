@@ -12,15 +12,11 @@ import (
 	"compress/zlib"
 	"context"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/binary"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"path"
-	"strings"
 )
 
 type Entry struct {
@@ -41,31 +37,23 @@ type Archive struct {
 	SigStyle string
 }
 
-type tocFile struct {
-	Name string `xml:"name"`
-	Type string `xml:"type"`
-	Link string `xml:"link"`
-	Data *struct {
-		Offset   int64 `xml:"offset"`
-		Length   int64 `xml:"length"`
-		Size     int64 `xml:"size"`
-		Encoding struct {
-			Style string `xml:"style,attr"`
-		} `xml:"encoding"`
-	} `xml:"data"`
-	Files []tocFile `xml:"file"`
-}
-
-type tocSig struct {
-	Style string   `xml:"style,attr"`
-	Certs []string `xml:"KeyInfo>X509Data>X509Certificate"`
-}
-
-type toc struct {
-	Files     []tocFile `xml:"toc>file"`
-	Signature []tocSig  `xml:"toc>signature"`
-	XSig      []tocSig  `xml:"toc>x-signature"`
-}
+// Bounds on the table of contents. Real installer TOCs are a few KiB (one
+// entry per component file plus the signing chain) and compress about 3:1,
+// so these only stop crafted archives that inflate a tiny file into a huge
+// or deeply nested TOC.
+const (
+	maxTOCSize    = 4 << 20  // uncompressed bytes
+	maxTOCRatio   = 64       // uncompressed / compressed, checked once the TOC
+	maxTOCRatioAt = 64 << 10 // is larger than this
+	maxTOCEntries = 10000
+	maxTOCDepth   = 64 // nested elements
+	maxTOCCerts   = 32
+	maxTOCField   = 64 << 10 // text of one kept element (a certificate)
+	maxTOCName    = 1024     // one path component
+	maxTOCPaths   = 4 << 20  // all resolved entry paths together
+	maxTOCTag     = 4 << 10  // one start or end tag, attributes included
+	maxTOCTagName = 256      // one element or attribute name
+)
 
 // Open parses the archive header and table of contents.
 func Open(name string) (*Archive, error) {
@@ -85,52 +73,24 @@ func Open(name string) (*Archive, error) {
 		f.Close()
 		return nil, errors.New("not a xar archive")
 	}
-	if h.TOCCompLen > 64<<20 || h.TOCUncompLn > 256<<20 {
+	if h.TOCCompLen > maxTOCSize || h.TOCUncompLn > maxTOCSize {
 		f.Close()
 		return nil, errors.New("xar table of contents too large")
+	}
+	if h.TOCUncompLn > maxTOCRatioAt && h.TOCUncompLn > maxTOCRatio*h.TOCCompLen {
+		f.Close()
+		return nil, errors.New("xar table of contents implausibly compressed")
 	}
 	zr, err := zlib.NewReader(io.NewSectionReader(f, int64(h.HeaderSize), int64(h.TOCCompLen)))
 	if err != nil {
 		f.Close()
 		return nil, fmt.Errorf("xar toc: %w", err)
 	}
-	raw, err := io.ReadAll(io.LimitReader(zr, int64(h.TOCUncompLn)+1))
-	if err != nil {
-		f.Close()
-		return nil, fmt.Errorf("xar toc: %w", err)
-	}
-	var t toc
-	if err := xml.Unmarshal(raw, &t); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("xar toc: %w", err)
-	}
 	a := &Archive{f: f, heap: int64(h.HeaderSize) + int64(h.TOCCompLen)}
-	var walk func(prefix string, fs []tocFile)
-	walk = func(prefix string, fs []tocFile) {
-		for _, tf := range fs {
-			p := path.Join(prefix, tf.Name)
-			e := Entry{Path: p, Type: tf.Type, Link: tf.Link}
-			if tf.Data != nil {
-				e.Offset, e.Length, e.Size, e.Encoding = tf.Data.Offset, tf.Data.Length, tf.Data.Size, tf.Data.Encoding.Style
-			}
-			a.Entries = append(a.Entries, e)
-			walk(p, tf.Files)
-		}
-	}
-	walk("", t.Files)
-	for _, s := range append(t.Signature, t.XSig...) {
-		if a.SigStyle == "" {
-			a.SigStyle = s.Style
-		}
-		for _, c := range s.Certs {
-			der, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(c), ""))
-			if err != nil {
-				continue
-			}
-			if cert, err := x509.ParseCertificate(der); err == nil {
-				a.Certs = append(a.Certs, cert)
-			}
-		}
+	// Never inflate more than the declared size, which is already bounded.
+	if err := a.parseTOC(io.LimitReader(zr, int64(h.TOCUncompLn))); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("xar toc: %w", err)
 	}
 	return a, nil
 }

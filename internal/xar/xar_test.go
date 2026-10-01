@@ -2,13 +2,20 @@ package xar
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -411,4 +418,340 @@ func TestExtractCPIOLinkBudgetExhausted(t *testing.T) {
 			t.Errorf("link %s kept although the budget ran out", l)
 		}
 	}
+}
+
+// writeXar writes a xar archive whose TOC is the zlib-compressed output of
+// toc, declaring uncomp as its uncompressed length (len of the XML if 0).
+func writeXar(t *testing.T, toc func(io.Writer), uncomp uint64) string {
+	t.Helper()
+	var z bytes.Buffer
+	zw, _ := zlib.NewWriterLevel(&z, zlib.BestCompression)
+	cw := &countWriter{w: zw}
+	toc(cw)
+	zw.Close()
+	if uncomp == 0 {
+		uncomp = uint64(cw.n)
+	}
+	var b bytes.Buffer
+	b.WriteString("xar!")
+	binary.Write(&b, binary.BigEndian, struct {
+		HeaderSize  uint16
+		Version     uint16
+		TOCCompLen  uint64
+		TOCUncompLn uint64
+		ChecksumAlg uint32
+	}{28, 1, uint64(z.Len()), uncomp, 0})
+	b.Write(z.Bytes())
+	p := filepath.Join(t.TempDir(), "t.pkg")
+	if err := os.WriteFile(p, b.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+type countWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countWriter) Write(b []byte) (int, error) {
+	n, err := c.w.Write(b)
+	c.n += int64(n)
+	return n, err
+}
+
+func xmlTOC(s string) func(io.Writer) {
+	return func(w io.Writer) { io.WriteString(w, s) }
+}
+
+func TestTOCParse(t *testing.T) {
+	p := writeXar(t, xmlTOC(`<?xml version="1.0" encoding="UTF-8"?>
+<xar><toc><checksum style="sha1"><offset>0</offset><size>20</size></checksum>
+<signature style="RSA"><KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><X509Data><X509Certificate>bm90IGEgY2VydA==</X509Certificate></X509Data></KeyInfo></signature>
+<file id="1"><name>Distribution</name><type>file</type>
+ <data><length>10</length><encoding style="application/x-gzip"/><offset>20</offset><size>30</size></data></file>
+<file id="2"><type>directory</type>
+ <file id="3"><name>Payload</name><type>file</type><data><offset> 40 </offset><length>5</length><size>6</size>
+  <encoding style="application/octet-stream"/></data></file>
+ <file id="4"><name>link</name><type>symlink</type><link>Payload</link></file>
+ <name>a.pkg</name></file>
+</toc></xar>`), 0)
+	a, err := Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	want := []Entry{
+		{Path: "Distribution", Type: "file", Offset: 20, Length: 10, Size: 30, Encoding: "application/x-gzip"},
+		{Path: "a.pkg", Type: "directory"},
+		{Path: "a.pkg/Payload", Type: "file", Offset: 40, Length: 5, Size: 6, Encoding: "application/octet-stream"},
+		{Path: "a.pkg/link", Type: "symlink", Link: "Payload"},
+	}
+	if fmt.Sprint(a.Entries) != fmt.Sprint(want) {
+		t.Errorf("entries:\n got %+v\nwant %+v", a.Entries, want)
+	}
+	if a.SigStyle != "RSA" || len(a.Certs) != 0 {
+		t.Errorf("sig style %q", a.SigStyle)
+	}
+}
+
+// A tiny archive whose TOC inflates to tens of MiB of <file> elements must be
+// rejected quickly without materialising it.
+func TestTOCBombRejected(t *testing.T) {
+	huge := func(w io.Writer) {
+		io.WriteString(w, "<xar><toc>")
+		chunk := []byte(strings.Repeat("<file><name>a</name></file>", 1<<12))
+		for range 100 { // ~11 MiB
+			w.Write(chunk)
+		}
+		io.WriteString(w, "</toc></xar>")
+	}
+	bombs := map[string]string{
+		"huge": writeXar(t, huge, 0),
+		// Declares a plausible size; inflation must stop there regardless.
+		"lying": writeXar(t, huge, 1<<20),
+		// Varied names keep these within the size and ratio limits so the
+		// streaming caps are what reject them.
+		"entries": writeXar(t, func(w io.Writer) {
+			io.WriteString(w, "<xar><toc>")
+			for i := range 20000 {
+				fmt.Fprintf(w, "<file><name>%x</name></file>", i*2654435761)
+			}
+			io.WriteString(w, "</toc></xar>")
+		}, 0),
+		"ratio": writeXar(t, xmlTOC("<xar><toc>"+strings.Repeat("<file><name>a</name></file>", 60000)+"</toc></xar>"), 0),
+		"depth": writeXar(t, xmlTOC("<xar><toc>"+strings.Repeat("<file>", 1000)+strings.Repeat("</file>", 1000)+"</toc></xar>"), 0),
+		// Each child's path copies its parent's, so one long directory name,
+		// or a chain of moderate ones, is amplified per descendant. Random
+		// junk keeps the ratio plausible.
+		"longname": writeXar(t, func(w io.Writer) {
+			io.WriteString(w, "<xar><toc>")
+			writeJunk(w)
+			io.WriteString(w, "<file><name>"+strings.Repeat("A", 3<<20)+"</name>")
+			io.WriteString(w, strings.Repeat("<file><name>a</name></file>", 1600))
+			io.WriteString(w, "</file></toc></xar>")
+		}, 0),
+		"name": writeXar(t, xmlTOC("<xar><toc><file><name>"+strings.Repeat("C", 2000)+"</name></file></toc></xar>"), 0),
+		// An over-long end tag name, and a long tag spread over attributes
+		// whose values hide '>'.
+		"endtag": writeXar(t, func(w io.Writer) {
+			io.WriteString(w, "<xar><toc>")
+			writeJunk(w)
+			io.WriteString(w, "</"+strings.Repeat("E", 3<<20)+"></toc></xar>")
+		}, 0),
+		"gtattrs": writeXar(t, func(w io.Writer) {
+			io.WriteString(w, "<xar><toc>")
+			writeJunk(w)
+			io.WriteString(w, "<a"+strings.Repeat(` a=">"`, 600000)+"/></toc></xar>")
+		}, 0),
+		// One start tag holding hundreds of thousands of attributes: a
+		// decoder that materialises them amplifies the TOC many times over.
+		"attrs": writeXar(t, func(w io.Writer) {
+			io.WriteString(w, "<xar><toc>")
+			writeJunk(w)
+			io.WriteString(w, "<a"+strings.Repeat(` a=""`, 780000)+"/></toc></xar>")
+		}, 0),
+		// Deeply nested unknown elements with long tag names: per-element
+		// paths would grow with depth squared times name length.
+		"tagnames": writeXar(t, func(w io.Writer) {
+			io.WriteString(w, "<xar><toc>")
+			writeJunk(w)
+			tag := strings.Repeat("T", 30000)
+			io.WriteString(w, strings.Repeat("<"+tag+">", 62)+strings.Repeat("</"+tag+">", 62))
+			io.WriteString(w, "</toc></xar>")
+		}, 0),
+		"paths": writeXar(t, func(w io.Writer) {
+			io.WriteString(w, "<xar><toc>")
+			writeJunk(w)
+			for i := range 30 {
+				fmt.Fprintf(w, "<file><name>%d%s</name>", i, strings.Repeat("B", 1000))
+			}
+			io.WriteString(w, strings.Repeat("<file><name>a</name></file>", 9000))
+			io.WriteString(w, strings.Repeat("</file>", 30)+"</toc></xar>")
+		}, 0),
+	}
+	for name, p := range bombs {
+		if st, _ := os.Stat(p); st.Size() > 256<<10 {
+			t.Fatalf("%s: bomb is %d bytes, want tiny", name, st.Size())
+		}
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		t0 := time.Now()
+		a, err := Open(p)
+		el := time.Since(t0)
+		runtime.ReadMemStats(&after)
+		if err == nil {
+			a.Close()
+			t.Errorf("%s: bomb accepted with %d entries", name, len(a.Entries))
+		} else {
+			t.Logf("%s: %v (%v, allocated %d KiB)", name, err, el, (after.TotalAlloc-before.TotalAlloc)>>10)
+		}
+		if d := after.TotalAlloc - before.TotalAlloc; d > maxBombAlloc {
+			t.Errorf("%s: Open allocated %d MiB", name, d>>20)
+		}
+		if el > 5*time.Second {
+			t.Errorf("%s: Open took %v", name, el)
+		}
+	}
+}
+
+// maxBombAlloc bounds what parsing any crafted TOC may allocate: a small
+// multiple of the TOC caps, whatever the XML shape.
+const maxBombAlloc = 16 << 20
+
+// Markup that stays within every per-tag limit but is repeated to fill the
+// TOC must still cost memory proportional to what is kept, not to its size.
+func TestTOCMarkupWithinLimitsIsCheap(t *testing.T) {
+	attrs := strings.Repeat(` a="x"`, 600) // ~3.6 KiB per tag
+	tag := strings.Repeat("T", 250)
+	shapes := map[string]func(io.Writer){
+		"attrs": func(w io.Writer) {
+			io.WriteString(w, "<xar><toc>")
+			writeJunk(w)
+			for range 250 {
+				io.WriteString(w, "<file"+attrs+"><name"+attrs+">n</name><data"+attrs+"><encoding"+attrs+" style='s'/></data></file>")
+			}
+			io.WriteString(w, "</toc></xar>")
+		},
+		"names": func(w io.Writer) {
+			io.WriteString(w, "<xar><toc>")
+			writeJunk(w)
+			for range 120 {
+				io.WriteString(w, strings.Repeat("<"+tag+">", 60)+strings.Repeat("</"+tag+">", 60))
+			}
+			io.WriteString(w, "</toc></xar>")
+		},
+	}
+	for name, toc := range shapes {
+		p := writeXar(t, toc, 0)
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		a, err := Open(p)
+		runtime.ReadMemStats(&after)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		a.Close()
+		d := after.TotalAlloc - before.TotalAlloc
+		t.Logf("%s: %d entries, allocated %d KiB", name, len(a.Entries), d>>10)
+		if d > 2<<20 {
+			t.Errorf("%s: Open allocated %d KiB", name, d>>10)
+		}
+	}
+}
+
+// refFile mirrors the TOC with xml.Unmarshal, which the streaming parser
+// must agree with on every element it keeps.
+type refFile struct {
+	Name string `xml:"name"`
+	Type string `xml:"type"`
+	Link string `xml:"link"`
+	Data struct {
+		Offset   string `xml:"offset"`
+		Length   string `xml:"length"`
+		Size     string `xml:"size"`
+		Encoding struct {
+			Style string `xml:"style,attr"`
+		} `xml:"encoding"`
+	} `xml:"data"`
+	Files []refFile `xml:"file"`
+}
+
+type refSig struct {
+	Style string   `xml:"style,attr"`
+	Certs []string `xml:"KeyInfo>X509Data>X509Certificate"`
+}
+
+func refEntries(dir string, fs []refFile, out []Entry) []Entry {
+	for _, f := range fs {
+		p := path.Join(dir, f.Name)
+		off, _ := parseInt(f.Data.Offset)
+		ln, _ := parseInt(f.Data.Length)
+		sz, _ := parseInt(f.Data.Size)
+		out = append(out, Entry{Path: p, Type: f.Type, Offset: off, Length: ln, Size: sz, Encoding: f.Data.Encoding.Style, Link: f.Link})
+		out = refEntries(p, f.Files, out)
+	}
+	return out
+}
+
+func TestTOCMatchesUnmarshal(t *testing.T) {
+	tocs := []string{
+		// Text interrupted by child elements, comments and PIs is joined.
+		`<xar><toc><file><name>ab<x>zz</x>cd</name><type>fi<!-- c -->le</type><link>l<?pi x?>k</link></file></toc></xar>`,
+		// References, CDATA, line ends, namespaces, single quotes, spaces.
+		"<?xml version='1.0'?>\n<!-- lead -->\n<xar>\r\n<toc ><file id='1'\n><name>a&amp;b&#65;&#x42;&lt;&gt;&quot;&apos;</name>" +
+			"<type><![CDATA[x]y]]z]]]></type><link>l1\r\nl2\rl3</link>" +
+			"<data ><offset > 7 </offset><length/><size>9</size><encoding a=\"1\" style = 'q&amp;r' style2='z' /></data></file>" +
+			"<x:file xmlns:x='urn:x'><x:name>ns</x:name></x:file></toc></xar>",
+		// Repeated elements: the last wins; nested and sibling files.
+		`<r><toc><file><name>a</name><name>b</name><file><name>c</name><file><name>d</name></file></file></file>` +
+			`<file><name>e</name><data><encoding style="1"/><encoding style="2"/></data></file></toc></r>`,
+		// Files and names outside the places they count are ignored.
+		`<xar><file><name>no</name></file><toc><other><file><name>no</name></file></other>` +
+			`<file><data><file><name>no</name></file></data><name>yes</name></file></toc></xar>`,
+		// Signatures.
+		`<xar><toc><signature style="RSA" other="1"><KeyInfo><X509Data><X509Certificate>QUJD</X509Certificate>` +
+			`<X509Certificate>REVG</X509Certificate></X509Data></KeyInfo></signature>` +
+			`<x-signature style="CMS"/></toc></xar>`,
+	}
+	for i, doc := range tocs {
+		var ref struct {
+			Files []refFile `xml:"toc>file"`
+			Sig   []refSig  `xml:"toc>signature"`
+			XSig  []refSig  `xml:"toc>x-signature"`
+		}
+		if err := xml.Unmarshal([]byte(doc), &ref); err != nil {
+			t.Fatalf("%d: reference: %v", i, err)
+		}
+		a := &Archive{}
+		if err := a.parseTOC(strings.NewReader(doc)); err != nil {
+			t.Errorf("%d: %v", i, err)
+			continue
+		}
+		want := refEntries("", ref.Files, nil)
+		if !reflect.DeepEqual(a.Entries, want) {
+			t.Errorf("%d: entries\n got %#v\nwant %#v", i, a.Entries, want)
+		}
+		wantStyle := ""
+		for _, s := range append(ref.Sig, ref.XSig...) {
+			if wantStyle == "" {
+				wantStyle = s.Style
+			}
+		}
+		if a.SigStyle != wantStyle {
+			t.Errorf("%d: sig style %q, want %q", i, a.SigStyle, wantStyle)
+		}
+	}
+}
+
+func TestTOCMalformedRejected(t *testing.T) {
+	for _, doc := range []string{
+		`<xar><toc></xar></toc>`,
+		`<xar><toc><file><name>a</name></file></toc>`,
+		`<xar><toc><file><name>a&bogus;</name></file></toc></xar>`,
+		`<xar><toc><file><name>a&#0;</name></file></toc></xar>`,
+		`<xar><toc><file a=b><name>a</name></file></toc></xar>`,
+		`<xar><toc><file a="<"><name>a</name></file></toc></xar>`,
+		`<xar><toc><file a="1"b="2"></file></toc></xar>`,
+		`<!DOCTYPE x [<!ENTITY e "boom">]><xar><toc></toc></xar>`,
+		`<xar><toc><file><name>a<![CDATA[b</name></file></toc></xar>`,
+		`<xar><toc><file><name>a<!-- b</name></file></toc></xar>`,
+		"<xar><toc><file><name>\xff</name></file></toc></xar>",
+		`</xar>`,
+		``,
+	} {
+		if err := (&Archive{}).parseTOC(strings.NewReader(doc)); err == nil {
+			t.Errorf("accepted %q", doc)
+		}
+	}
+}
+
+// writeJunk writes an element holding 80 KiB of incompressible hex.
+func writeJunk(w io.Writer) {
+	b := make([]byte, 80<<10)
+	rand.NewChaCha8([32]byte{1}).Read(b)
+	io.WriteString(w, "<junk>"+hex.EncodeToString(b)+"</junk>")
 }

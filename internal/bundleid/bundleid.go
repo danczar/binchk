@@ -13,9 +13,19 @@
 // The Quick Look extension (macos/QuickLook, BinchkIndex.swift) implements
 // the same algorithm; both sides test it against the same vector. Any
 // change here must be made there too.
+//
+// The fingerprint records file sizes, not contents, so that a reader can
+// compute it from metadata and two files only. It tells items apart in the
+// report index, but it does not vouch for every byte: a copy with a nested
+// file swapped for another of the same size has the same fingerprint.
+// Trust therefore uses the bundle contents digest (Contents), the same
+// encoding with each file's SHA-256 in place of its size. Only binchk
+// computes it (it reads every file); the allowlist and Mark as safe key
+// bundles by it.
 package bundleid
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -32,6 +42,9 @@ import (
 
 // Domain separates fingerprints from every other SHA-256 binchk computes.
 const Domain = "binchk bundle fingerprint v2"
+
+// ContentsDomain separates contents digests from fingerprints.
+const ContentsDomain = "binchk bundle contents v2"
 
 // NoCodeResources stands in for the seal's hash when a bundle has no
 // regular Contents/_CodeSignature/CodeResources file.
@@ -56,8 +69,20 @@ type Tree struct {
 // Summarize walks dir without following symbolic links (dir itself is
 // taken as given).
 func Summarize(dir string) Tree {
+	t, _ := SummarizeLimit(dir, 0)
+	return t
+}
+
+// SummarizeLimit is Summarize that stops after limit entries (0: no
+// limit), and reports whether it saw the whole tree.
+func SummarizeLimit(dir string, limit int64) (Tree, bool) {
 	var t Tree
+	complete := true
 	filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if limit > 0 && t.Entries >= limit {
+			complete = false
+			return filepath.SkipAll
+		}
 		if err != nil {
 			return nil
 		}
@@ -70,7 +95,7 @@ func Summarize(dir string) Tree {
 		t.MtimeUnixNs = max(t.MtimeUnixNs, info.ModTime().UnixNano())
 		return nil
 	})
-	return t
+	return t, complete
 }
 
 // Root resolves a bundle path to the directory that is walked: symbolic
@@ -161,18 +186,105 @@ func Fingerprint(bundle, mainSHA256 string) (string, error) {
 	return Encode(strings.ToLower(mainSHA256), seal, m), nil
 }
 
+// Contents computes the bundle contents digest of bundle, whose main
+// executable is Contents/MacOS/exe: the fingerprint's encoding under
+// ContentsDomain, with the SHA-256 of every regular file as its manifest
+// value (the seal's and the main executable's included). It reads every
+// file in the bundle, without following symbolic links, and also returns
+// the main executable's SHA-256 so a caller can check that it hashed the
+// same main executable as the analysis did.
+func Contents(ctx context.Context, bundle, exe string) (digest, mainSHA256 string, err error) {
+	if !ValidExecutableName(exe) {
+		return "", "", errors.New("bundleid: invalid main executable name")
+	}
+	root, err := Root(bundle)
+	if err != nil {
+		return "", "", err
+	}
+	m, err := Manifest(root)
+	if err != nil {
+		return "", "", err
+	}
+	seal := NoCodeResources
+	mainRel := "Contents/MacOS/" + exe
+	for i := range m {
+		e := &m[i]
+		if e.Type != 'f' {
+			continue
+		}
+		sum, err := hashRegular(ctx, filepath.Join(root, filepath.FromSlash(e.Path)))
+		if err != nil {
+			return "", "", err
+		}
+		e.Value = sum
+		switch e.Path {
+		case mainRel:
+			mainSHA256 = sum
+		case "Contents/_CodeSignature/CodeResources":
+			seal = sum
+		}
+	}
+	if mainSHA256 == "" {
+		return "", "", errors.New("bundleid: no main executable")
+	}
+	return encode(ContentsDomain, mainSHA256, seal, m), mainSHA256, nil
+}
+
+// hashRegular hashes the regular file at p, refusing one that is replaced
+// (e.g. by a symbolic link) between the check and the read.
+func hashRegular(ctx context.Context, p string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	st, err := os.Lstat(p)
+	if err != nil {
+		return "", err
+	}
+	if !st.Mode().IsRegular() {
+		return "", errors.New("bundleid: " + p + " is no longer a regular file")
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if fst, err := f.Stat(); err != nil || !os.SameFile(st, fst) {
+		return "", errors.New("bundleid: " + p + " changed while reading")
+	}
+	h := sha256.New()
+	buf := make([]byte, 1<<20)
+	for {
+		n, err := f.Read(buf)
+		h.Write(buf[:n])
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 // Encode is the canonical, length-prefixed encoding, hashed:
 //
 //	str(Domain) str(main) str(seal) u64(len(m)) { str(path) str(type) str(value) }
 //
 // where str(s) is u64(len(s)) followed by s, and u64 is big-endian.
 func Encode(mainSHA256, seal string, m []Entry) string {
+	return encode(Domain, mainSHA256, seal, m)
+}
+
+func encode(domain, mainSHA256, seal string, m []Entry) string {
 	h := sha256.New()
 	str := func(s string) {
 		u64(h, uint64(len(s)))
 		io.WriteString(h, s)
 	}
-	str(Domain)
+	str(domain)
 	str(mainSHA256)
 	str(seal)
 	u64(h, uint64(len(m)))

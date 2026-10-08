@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -34,7 +35,7 @@ type Recorder struct {
 // IdentityState) taken before analysis; nil skips the path pointers. The
 // returned entry is never nil, even when publishing fails.
 func (rc *Recorder) Record(r *analyze.Report, path, reportPath string, st *index.State) (*index.Entry, error) {
-	_, safe := rc.Allow.Lookup(r.ContentKey())
+	_, safe := rc.Allow.Lookup(r.TrustKey())
 	e := index.NewEntry(r, path, reportPath, rc.Version, safe)
 	var errs []error
 	if rc.Index != nil && index.IsDigest(e.EntryID) {
@@ -71,16 +72,66 @@ func (rc *Recorder) Record(r *analyze.Report, path, reportPath string, st *index
 }
 
 // pointerPaths is path, plus the same item reached through its folder's
-// real path when that differs (e.g. /tmp vs /private/tmp on macOS), since
-// a reader may see either spelling.
+// real path when that differs (e.g. /tmp vs /private/tmp on macOS), and
+// under its name as the folder lists it when that is spelled differently
+// (APFS matches names regardless of Unicode normalization, so a shell may
+// hand binchk an NFC name for a file stored as NFD), since a reader may see
+// any of these spellings.
 func pointerPaths(path string) []string {
-	out := []string{path}
-	if dir, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
-		if alt := filepath.Join(dir, filepath.Base(path)); alt != path {
-			out = append(out, alt)
+	dirs := []string{filepath.Dir(path)}
+	if dir, err := filepath.EvalSymlinks(dirs[0]); err == nil && dir != dirs[0] {
+		dirs = append(dirs, dir)
+	}
+	names := append([]string{filepath.Base(path)}, listedNames(path)...)
+	var out []string
+	for _, d := range dirs {
+		for _, n := range names {
+			if p := filepath.Join(d, n); !slices.Contains(out, p) {
+				out = append(out, p)
+			}
 		}
 	}
 	return out
+}
+
+// listedNames returns the names, other than path's own, under which path's
+// folder lists the item at path: only for non-ASCII names (normalization
+// is the only way two spellings name one item there) and only for an item
+// that has no other hard link, so another name for the same file is never
+// taken for a spelling of this one.
+func listedNames(path string) []string {
+	dir, base := filepath.Split(path)
+	if isASCII(base) {
+		return nil
+	}
+	st, err := os.Lstat(path)
+	if err != nil || (!st.IsDir() && linkCount(st) != 1) {
+		return nil
+	}
+	des, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, de := range des {
+		name := de.Name()
+		if name == base || isASCII(name) {
+			continue
+		}
+		if ost, err := os.Lstat(filepath.Join(dir, name)); err == nil && os.SameFile(st, ost) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
 }
 
 // tag applies the Finder tag policy: verdicts in tag_verdicts get binchk's
@@ -103,18 +154,15 @@ func (rc *Recorder) untag(path string) error {
 	return findertag.Clear(path)
 }
 
-// holds reports whether path still holds e's content: through a fresh
-// pointer to e, or else by computing its content key.
+// holds reports whether path still holds exactly e's content, by hashing
+// it: a path pointer's staleness data and a bundle's fingerprint are
+// metadata, not enough to take a tag off.
 func (rc *Recorder) holds(path string, e *index.Entry) bool {
-	st, err := IdentityState(path)
-	if err != nil || st.Kind != e.Kind {
+	if !index.IsDigest(e.TrustKey) {
 		return false
 	}
-	if p, err := rc.Index.Pointer(path); err == nil && p.Entry == e.EntryID && p.Matches(st) {
-		return true
-	}
-	key, kind, err := ContentKey(path)
-	return err == nil && kind == e.Kind && key == e.ContentKey
+	key, kind, err := TrustKey(path)
+	return err == nil && kind == e.Kind && key == e.TrustKey
 }
 
 // IdentityState returns what a path pointer records about path: a file's
@@ -163,6 +211,22 @@ func ContentKey(path string) (key, kind string, err error) {
 		return "", index.KindBundle, err
 	}
 	key, err = bundleid.Fingerprint(path, sum)
+	return key, index.KindBundle, err
+}
+
+// TrustKey computes path's trust key and kind as the allowlist uses it: a
+// file's SHA-256, or an app bundle's contents digest (which reads every
+// file in it).
+func TrustKey(path string) (key, kind string, err error) {
+	if !detect.IsAppBundle(path) {
+		key, err = sha256File(path)
+		return key, index.KindFile, err
+	}
+	exe, ok := container.MainExecutable(path)
+	if !ok {
+		return "", index.KindBundle, errors.New("app bundle has no valid main executable")
+	}
+	key, _, err = bundleid.Contents(context.Background(), path, filepath.Base(exe))
 	return key, index.KindBundle, err
 }
 

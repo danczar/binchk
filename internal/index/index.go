@@ -13,6 +13,11 @@
 // the same path and content again replaces the entry, and different items
 // never share one. p is the SHA-256 of the path's UTF-8 bytes.
 //
+// An entry also records its trust key (Entry.TrustKey): what the allowlist
+// and Mark as safe use. For a file it is the content key; for a bundle it is
+// the bundle contents digest, which, unlike the fingerprint, covers every
+// byte of every file in it. Readers do not use it.
+//
 // A reader finds the entry for an item through its path pointer while the
 // pointer's staleness data still matches the item; otherwise it computes
 // the content key and falls back to the content map, which names the most
@@ -65,7 +70,10 @@ type Entry struct {
 	Version    int    `json:"version"`
 	EntryID    string `json:"entry_id"`
 	ContentKey string `json:"content_key"`
-	Kind       string `json:"kind"`
+	// TrustKey is r.TrustKey(): the file's SHA-256, or the bundle contents
+	// digest ("" when binchk could not read the whole bundle).
+	TrustKey string `json:"trust_key"`
+	Kind     string `json:"kind"`
 	// SHA256 is the file's SHA-256; for a bundle, its main executable's.
 	SHA256        string    `json:"sha256"`
 	FileName      string    `json:"file_name"`
@@ -166,7 +174,7 @@ type ContentRef struct {
 // is r.ContentKey(); without one the entry has no id and is not stored.
 func NewEntry(r *analyze.Report, path, reportPath, version string, markedSafe bool) *Entry {
 	e := &Entry{
-		Version: SchemaVersion, ContentKey: strings.ToLower(r.ContentKey()), Kind: KindFile,
+		Version: SchemaVersion, ContentKey: strings.ToLower(r.ContentKey()), TrustKey: strings.ToLower(r.TrustKey()), Kind: KindFile,
 		SHA256: strings.ToLower(r.Hashes.SHA256), FileName: r.FileName, Path: path,
 		Format: r.Format, Verdict: string(r.Verdict), Score: r.Score, Summary: r.Summary,
 		Signer: r.Signature.Signer, Notarized: r.Signature.Notarized, Gatekeeper: r.Signature.Gatekeeper,
@@ -444,15 +452,22 @@ func (x *Index) All() ([]*Entry, error) {
 	return out, nil
 }
 
-// ByContent returns every entry for content key key.
-func (x *Index) ByContent(key string) ([]*Entry, error) {
+// ByTrust returns every entry of kind whose trust key is key.
+func (x *Index) ByTrust(kind, key string) ([]*Entry, error) {
+	if !IsDigest(key) {
+		return nil, fmt.Errorf("index: invalid trust key %q", key)
+	}
+	return x.filter(func(e *Entry) bool { return e.Kind == kind && e.TrustKey == key })
+}
+
+func (x *Index) filter(keep func(*Entry) bool) ([]*Entry, error) {
 	all, err := x.All()
 	if err != nil {
 		return nil, err
 	}
 	var out []*Entry
 	for _, e := range all {
-		if e.ContentKey == key {
+		if keep(e) {
 			out = append(out, e)
 		}
 	}

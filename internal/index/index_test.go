@@ -53,7 +53,7 @@ func TestNewEntry(t *testing.T) {
 	at := time.Date(2026, 10, 8, 14, 3, 4, 5e8, time.FixedZone("x", 3600))
 	path := "/Users/u/Downloads/tool.dmg"
 	e := NewEntry(sampleReport("tool.dmg", sha, at), path, "/r/x.html", "v0.2.0", false)
-	if e.SHA256 != sha || e.ContentKey != sha || e.Kind != KindFile || e.EntryID != EntryID(path, sha) ||
+	if e.SHA256 != sha || e.ContentKey != sha || e.TrustKey != sha || e.Kind != KindFile || e.EntryID != EntryID(path, sha) ||
 		e.Version != 2 || e.AnalyzedAt != "2026-10-08T13:03:04Z" || e.BinchkVersion != "v0.2.0" ||
 		e.Signer == "" || !e.Notarized || e.Gatekeeper == "" || e.Verdict != "Suspicious" || e.Score != 42 ||
 		!slices.Equal(e.Paths, []string{path}) {
@@ -72,7 +72,7 @@ func TestNewEntry(t *testing.T) {
 	b, _ := json.Marshal(e)
 	var m map[string]any
 	json.Unmarshal(b, &m)
-	for _, k := range []string{"version", "entry_id", "content_key", "kind", "sha256", "file_name", "path", "format",
+	for _, k := range []string{"version", "entry_id", "content_key", "trust_key", "kind", "sha256", "file_name", "path", "format",
 		"verdict", "score", "summary", "signer", "notarized", "gatekeeper", "top_findings", "report_path",
 		"analyzed_at", "marked_safe", "binchk_version", "paths"} {
 		if _, ok := m[k]; !ok {
@@ -90,11 +90,18 @@ func TestNewEntry(t *testing.T) {
 		t.Fatalf("%s", b)
 	}
 
-	// A bundle is keyed by its fingerprint, never its main executable.
-	fp := digest("fingerprint")
-	be := NewEntry(bundleReport("T.app", sha, fp, at), "/A/T.app", "", "", false)
-	if be.Kind != KindBundle || be.ContentKey != fp || be.SHA256 != sha || be.EntryID != EntryID("/A/T.app", fp) {
+	// A bundle is keyed by its fingerprint and trusted by its contents
+	// digest, never by its main executable.
+	fp, contents := digest("fingerprint"), digest("contents")
+	br := bundleReport("T.app", sha, fp, at)
+	br.Hashes.BundleContents = contents
+	be := NewEntry(br, "/A/T.app", "", "", false)
+	if be.Kind != KindBundle || be.ContentKey != fp || be.TrustKey != contents || be.SHA256 != sha || be.EntryID != EntryID("/A/T.app", fp) {
 		t.Fatalf("bundle entry %+v", be)
+	}
+	// Without a contents digest it cannot be trusted, but is still indexed.
+	if ue := NewEntry(bundleReport("T.app", sha, fp, at), "/A/T.app", "", "", false); ue.TrustKey != "" || ue.EntryID != be.EntryID {
+		t.Fatalf("bundle without contents digest %+v", ue)
 	}
 	// Without a fingerprint it has no identity at all.
 	if ne := NewEntry(bundleReport("T.app", sha, "", at), "/A/T.app", "", "", false); ne.EntryID != "" || ne.ContentKey != "" {
@@ -386,7 +393,7 @@ func TestCard(t *testing.T) {
 	}
 }
 
-func TestRecentAndByContent(t *testing.T) {
+func TestRecentAndByTrust(t *testing.T) {
 	x, _ := Open(t.TempDir())
 	base := time.Now().Add(-time.Hour).Truncate(time.Second)
 	for i, name := range []string{"a", "b", "c", "d"} {
@@ -409,9 +416,27 @@ func TestRecentAndByContent(t *testing.T) {
 	if len(got) != 2 || got[0].FileName != "d" {
 		t.Fatalf("since: %+v", got)
 	}
-	same, err := x.ByContent(digest("ab"))
+	same, err := x.ByTrust(KindFile, digest("ab"))
 	if err != nil || len(same) != 2 {
-		t.Fatalf("by content: %+v %v", same, err)
+		t.Fatalf("by trust key: %+v %v", same, err)
+	}
+	// A bundle with the same fingerprint but other contents is not the same.
+	br := bundleReport("T.app", digest("main"), digest("ab"), base)
+	br.Hashes.BundleContents = digest("bundle contents")
+	if err := x.Put(NewEntry(br, "/d/T.app", "", "v", false), Extra{}); err != nil {
+		t.Fatal(err)
+	}
+	if same, _ := x.ByTrust(KindFile, digest("ab")); len(same) != 2 {
+		t.Fatalf("by trust key after a bundle: %+v", same)
+	}
+	if same, _ := x.ByTrust(KindBundle, digest("ab")); len(same) != 0 {
+		t.Fatalf("bundle found by its fingerprint: %+v", same)
+	}
+	if same, _ := x.ByTrust(KindBundle, digest("bundle contents")); len(same) != 1 || same[0].FileName != "T.app" {
+		t.Fatalf("bundle by contents digest: %+v", same)
+	}
+	if _, err := x.ByTrust(KindBundle, ""); err == nil {
+		t.Fatal("empty trust key accepted")
 	}
 }
 

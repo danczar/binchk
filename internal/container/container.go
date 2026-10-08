@@ -4,6 +4,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -149,6 +150,24 @@ func analyzeContainer(parent context.Context, eng *analyze.Engine, path string, 
 			in.mu.Unlock()
 		})
 	}
+	// The bundle contents digest reads every file in the bundle; it runs
+	// alongside the analysis, under its own deadline rather than the
+	// analysis budget, since a bundle without one can never be trusted.
+	type digest struct {
+		sum, main string
+		err       error
+	}
+	var contents chan digest
+	if f == detect.AppBundle && hashOK {
+		contents = make(chan digest, 1)
+		go func() {
+			cctx, cancel := context.WithTimeout(parent, max(eng.Budget(), contentsTimeout))
+			defer cancel()
+			var d digest
+			d.sum, d.main, d.err = bundleid.Contents(cctx, path, filepath.Base(hashTarget))
+			contents <- d
+		}()
+	}
 	if hashOK {
 		in.goTask(func() {
 			t0 := time.Now()
@@ -187,6 +206,25 @@ func analyzeContainer(parent context.Context, eng *analyze.Engine, path string, 
 		fp, err := bundleid.Fingerprint(path, r.Hashes.SHA256)
 		in.timed("bundle fingerprint", t0, err)
 		r.Hashes.Bundle = fp
+	}
+	if contents != nil {
+		t0 := time.Now()
+		d := <-contents
+		switch {
+		case d.err != nil:
+		case r.Hashes.SHA256 == "":
+			d.err = errors.New("the main executable was not hashed")
+		case d.main != r.Hashes.SHA256:
+			d.err = errors.New("the main executable changed during analysis")
+		}
+		in.timed("bundle contents", t0, d.err)
+		if d.err == nil {
+			r.Hashes.BundleContents = d.sum
+		} else {
+			in.add(analyze.Finding{ID: "bundle-contents-unhashed", Title: "App bundle's contents were not fully hashed",
+				Detail:   "binchk could not read every file in it, so it cannot be matched by the allowlist or marked as safe. Analyse it again once it has stopped changing.",
+				Severity: analyze.Info, Category: "engine", Evidence: []string{d.err.Error()}})
+		}
 	}
 	in.finalize(start)
 	in.release()
@@ -500,6 +538,9 @@ func contains(ss []string, s string) bool {
 	}
 	return false
 }
+
+// contentsTimeout is the least time an app bundle's contents digest gets.
+const contentsTimeout = 3 * time.Minute
 
 // maxInfoPlist bounds the Info.plist read for a bundle's identity (the
 // Quick Look reader uses the same limit).

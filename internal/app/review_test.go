@@ -257,3 +257,65 @@ func TestReviewEscapingExecutable(t *testing.T) {
 		t.Fatalf("bundle borrowed an outside identity: %s %d %s", e.Verdict, e.Score, e.Summary)
 	}
 }
+
+// A trojanized copy that keeps the main executable and the seal and swaps a
+// nested library for a payload of exactly the same size has the same bundle
+// fingerprint (which records sizes only). Trusting the clean app must still
+// not trust it: the allowlist keys a bundle by its full contents.
+func TestReviewSameSizePayloadNotTrusted(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("app bundles are handled on macOS")
+	}
+	payload := payloadFile(t)
+	h := bundleHarness(t, payload)
+	b, err := os.ReadFile(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b[len(b)-1] ^= 0xff
+	benignLib := filepath.Join(t.TempDir(), "libx.dylib")
+	if err := os.WriteFile(benignLib, b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(h.root, "apps")
+	benign := makeBundle(t, dir, "Benign", "Tool", "/bin/echo", map[string]string{"Contents/Frameworks/libx.dylib": benignLib})
+	trojan := makeBundle(t, dir, "Trojan", "Tool", "/bin/echo", map[string]string{"Contents/Frameworks/libx.dylib": payload})
+	copied := makeBundle(t, filepath.Join(h.root, "copy"), "Benign", "Tool", "/bin/echo", map[string]string{"Contents/Frameworks/libx.dylib": benignLib})
+
+	ce := h.analyse(t, copied)
+	be := h.analyse(t, benign)
+	te := h.analyse(t, trojan)
+	if te.Verdict != "Malicious" {
+		t.Fatalf("trojan: %s %d %s", te.Verdict, te.Score, te.Summary)
+	}
+	if be.ContentKey != te.ContentKey {
+		t.Fatalf("fingerprints differ (%s, %s): the test no longer reproduces the collision", be.ContentKey, te.ContentKey)
+	}
+	if be.TrustKey == te.TrustKey || !index.IsDigest(be.TrustKey) {
+		t.Fatalf("benign and trojan trust keys %q %q", be.TrustKey, te.TrustKey)
+	}
+	tagged := findertag.Supported() && len(tags(t, trojan)) == 1
+	markSafe(t, h, be)
+	if got, err := h.Index().Get(te.EntryID); err != nil || got.MarkedSafe {
+		t.Fatalf("trojan's entry marked safe with its sibling: %+v %v", got, err)
+	}
+	// An identical copy elsewhere is the same contents, and is marked too.
+	if ce.TrustKey != be.TrustKey {
+		t.Fatalf("identical copies have different trust keys")
+	}
+	if got, err := h.Index().Get(ce.EntryID); err != nil || !got.MarkedSafe {
+		t.Fatalf("identical copy not marked safe: %+v %v", got, err)
+	}
+	if tagged {
+		if got := tags(t, trojan); len(got) != 1 {
+			t.Errorf("trojan lost its tag: %q", got)
+		}
+	}
+	again := h.analyse(t, trojan)
+	if again.Verdict != "Malicious" || again.MarkedSafe {
+		t.Fatalf("trojan after marking its same-size sibling safe: %s %d %s", again.Verdict, again.Score, again.Summary)
+	}
+	if again := h.analyse(t, benign); again.Verdict != "Clean" || !again.MarkedSafe {
+		t.Fatalf("benign after marking it safe: %+v", again)
+	}
+}

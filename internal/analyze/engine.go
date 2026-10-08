@@ -682,7 +682,7 @@ func applyScore(r *Report, total int, allow *HashList) {
 	if trustedSigner && r.Verdict == VerdictMalicious && maxSev < Critical {
 		r.Verdict = VerdictSuspicious
 	}
-	if note, ok := allow.Lookup(r.ContentKey()); ok {
+	if note, ok := allow.Lookup(r.TrustKey()); ok {
 		title := "SHA-256 is on your allowlist"
 		if r.IsBundle() {
 			title = "This app bundle is on your allowlist"

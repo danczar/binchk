@@ -76,6 +76,9 @@ type Hashes struct {
 	SHA256  string `json:"sha256,omitempty"`
 	Imphash string `json:"imphash,omitempty"`
 	Bundle  string `json:"bundle_fingerprint,omitempty"`
+	// BundleContents is the bundle contents digest (bundleid.Contents),
+	// which covers every file's bytes: what the allowlist matches.
+	BundleContents string `json:"bundle_contents,omitempty"`
 }
 
 type Section struct {

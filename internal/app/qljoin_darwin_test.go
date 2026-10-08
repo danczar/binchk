@@ -149,6 +149,15 @@ func TestQuickLookJoin(t *testing.T) {
 	scan(plain)
 	expect(double, "hello.pdf.exe", "Suspicious", false)
 	expect(plain, "hello", "Clean", false)
+	// Scanned under an NFC spelling of a name stored as NFD (as zsh globbing
+	// passes it), the item still previews through its own pointer when
+	// Quick Look asks with the stored spelling.
+	nfd := filepath.Join(files, "cafe\u0301")
+	copyFile(t, benignSample, nfd)
+	scan(filepath.Join(files, "caf\u00e9"))
+	if r := expect(nfd, "caf\u00e9", "Clean", false); !strings.Contains(r.Outcome, "pointer") {
+		t.Errorf("NFD spelling resolved via %s, want its pointer", r.Outcome)
+	}
 	// An unanalysed copy falls back to the most recent analysis of the
 	// same bytes; the banner escapes what it shows.
 	odd := filepath.Join(files, `odd<img src=x>&"q"`)

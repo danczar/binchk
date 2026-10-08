@@ -264,7 +264,7 @@ func TestEndToEnd(t *testing.T) {
 	if err := h.MarkSafe(e.EntryID); err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := os.ReadFile(filepath.Join(h.root, "allowlist.txt")); !strings.Contains(string(b), e.ContentKey) {
+	if b, _ := os.ReadFile(filepath.Join(h.root, "allowlist.txt")); !strings.Contains(string(b), e.TrustKey) || e.TrustKey != e.ContentKey {
 		t.Fatalf("allowlist: %q", b)
 	}
 	if findertag.Supported() {
@@ -476,6 +476,9 @@ func TestBundleEndToEnd(t *testing.T) {
 	checkIndexed(t, h.Index(), target, e)
 	if e.Kind != index.KindBundle || e.ContentKey == e.SHA256 || e.SHA256 != fileSHA(t, filepath.Join(target, "Contents/MacOS/Tool")) {
 		t.Fatalf("bundle identity: kind %s, content key %s, main executable %s", e.Kind, e.ContentKey, e.SHA256)
+	}
+	if key, kind, err := TrustKey(target); err != nil || kind != index.KindBundle || key != e.TrustKey || key == e.ContentKey || key == e.SHA256 {
+		t.Fatalf("bundle trust key %s %s %v; entry %s", key, kind, err, e.TrustKey)
 	}
 	if e.Verdict == "Suspicious" || e.Verdict == "Malicious" {
 		if got := tags(t, target); len(got) != 1 || !strings.HasPrefix(got[0], "binchk: ") {

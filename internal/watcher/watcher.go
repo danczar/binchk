@@ -38,11 +38,15 @@ type pending struct {
 	count  int
 }
 
+// maxTreeEntries bounds the walk treeState makes on every settle poll: a
+// huge tree is summarised by its first entries only.
+const maxTreeEntries = 500000
+
 // treeState summarises a directory tree so a bundle can be considered
-// complete once it stops changing. It is the same summary the report index
-// records for a bundle's path pointer.
+// complete once it stops changing. It is the summary the report index
+// records for a bundle's path pointer, cut off after maxTreeEntries.
 func treeState(root string) (count int, size int64, mtime time.Time) {
-	t := bundleid.Summarize(root)
+	t, _ := bundleid.SummarizeLimit(root, maxTreeEntries)
 	return int(t.Entries), t.Size, time.Unix(0, t.MtimeUnixNs)
 }
 

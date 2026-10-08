@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -403,11 +404,13 @@ func NotificationBody(r *analyze.Report) string {
 	return what + ". Open binchk ▸ Recent reports."
 }
 
-// MarkSafe trusts the content of the entry with id: its content key (a
-// file's SHA-256, or an app bundle's fingerprint, never the bundle's main
-// executable alone) joins the allowlist. Every entry for that content is
+// MarkSafe trusts the content of the entry with id: its trust key (a
+// file's SHA-256, or an app bundle's contents digest, which covers every
+// byte in the bundle; never its main executable or its size-only
+// fingerprint) joins the allowlist. Every entry with that trust key is
 // marked safe and its card re-rendered, and binchk's Finder tag comes off
-// every path those entries were recorded at that still holds the content.
+// every path those entries were recorded at that still holds exactly that
+// content.
 func (a *App) MarkSafe(id string) error {
 	if !index.IsDigest(id) {
 		return errors.New("no index entry to mark as safe")
@@ -416,30 +419,36 @@ func (a *App) MarkSafe(id string) error {
 	if err != nil {
 		return err
 	}
-	key := e.ContentKey
+	key := e.TrustKey
 	if !index.IsDigest(key) {
-		return errors.New("no content key to mark as safe")
+		if e.Kind == index.KindBundle {
+			return errors.New("this app bundle's contents were not fully hashed; analyse it again before marking it as safe")
+		}
+		return errors.New("no content hash to mark as safe")
 	}
 	note := "marked safe: " + e.FileName
 	if e.Kind == index.KindBundle {
-		note += " (app bundle fingerprint)"
+		note += " (app bundle contents)"
 	}
 	if err := a.rec.Allow.Add(key, note); err != nil {
 		return fmt.Errorf("allowlist: %w", err)
 	}
-	same, err := a.rec.Index.ByContent(key)
+	same, err := a.rec.Index.ByTrust(e.Kind, key)
 	if err != nil {
 		return err
 	}
 	var errs []error
+	var done []os.FileInfo // items already checked, under any spelling
 	for _, s := range same {
-		if s.Kind != e.Kind {
-			continue
-		}
 		if _, err := a.rec.Index.SetMarkedSafe(s.EntryID, true); err != nil {
 			errs = append(errs, err)
 		}
 		for _, p := range s.Paths {
+			st, err := os.Lstat(p)
+			if err != nil || slices.ContainsFunc(done, func(d os.FileInfo) bool { return os.SameFile(d, st) }) {
+				continue
+			}
+			done = append(done, st)
 			if !a.rec.holds(p, s) {
 				continue
 			}
@@ -451,11 +460,11 @@ func (a *App) MarkSafe(id string) error {
 	a.Log.Printf("marked safe: %s (%s %s)", e.Path, e.Kind, key)
 	a.mu.Lock()
 	for _, r := range a.recent {
-		if r.ContentKey == key {
+		if r.Kind == e.Kind && r.TrustKey == key {
 			r.MarkedSafe = true
 		}
 	}
-	if a.latest != nil && a.latest.ContentKey == key {
+	if a.latest != nil && a.latest.Kind == e.Kind && a.latest.TrustKey == key {
 		a.latest.MarkedSafe = true
 	}
 	a.mu.Unlock()

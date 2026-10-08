@@ -15,9 +15,9 @@ when the executable itself lands in a watched folder:
   ("password: infected"), nested archives, and double extensions inside
   (`invoice.pdf.exe` in `invoice.zip`).
 
-Goal: treat archives like `.dmg` / `.pkg`. Quarantine the archive, look inside
-without extracting it to the user's disk and without running anything, and
-report on the contents within the same < 15 s budget.
+Goal: treat archives like `.dmg` / `.pkg`. Analyse the archive where it is,
+look inside without extracting it to the user's disk and without running
+anything, and report on the contents within the same < 15 s budget.
 
 ## Formats
 
@@ -40,7 +40,7 @@ extraction tools.
 
 - Add `detect.Archive` formats to `Sniff`. Magic comes first; the extension is only a hint (`.docx`, `.xlsx`, `.jar`, `.apk` are zips too, so see open questions).
 - Browser partial files (`.crdownload`, `.part`, …) are already ignored, and the existing settle logic covers archives being written.
-- **Interaction with bundle detection:** when Archive Utility extracts `Foo.zip` → `Foo.app`, binchk will now see the zip first and then the app. If the zip is already quarantined, the user can't extract it until they restore it, which is the intended outcome. If extraction raced ahead, the `.app` gets handled as it is today. Consider linking the two reports by provenance.
+- **Interaction with bundle detection:** when Archive Utility extracts `Foo.zip` → `Foo.app`, binchk will now see the zip first and then the app. A flagged zip carries its Finder tag and notification before the user extracts it; the extracted `.app` is then analysed as it is today. Consider linking the two reports by provenance.
 
 ### Inspection (new `internal/archive`, reusing `container.inspector`)
 
@@ -73,11 +73,11 @@ Scoring follows `FinalizeContainer`: archive findings plus the worst contained f
 - Decompression happens inside binchk. Readers must be context-aware and memory-bounded: never read a whole entry into memory, and use `io.LimitReader` everywhere.
 - Fuzz the new readers (`go test -fuzz`) on malformed archives. Parser panics are already recovered and turned into findings by the engine, and the archive layer needs the same.
 
-### Quarantine & UX
+### Reporting & UX
 
-- The archive file is quarantined as a regular file, which the vault already supports.
+- The archive file is indexed and tagged like any other file; the Quick Look card shows the archive's verdict and its top findings.
 - The report gets an "Archive contents" section: an entry table (name, size, compressed size, type, and verdict for analysed entries) plus notes on anything skipped.
-- Restore / Delete behave as they do for any file.
+- Mark as safe behaves as it does for any file.
 
 ### Config
 
@@ -87,7 +87,7 @@ Scoring follows `FinalizeContainer`: archive findings plus the worst contained f
 ## Open questions
 
 - **Office documents & other zip-based formats:** skip entirely, or at least look for embedded executables and OLE objects? (Leaning towards skipping for v1.)
-- **Should a clean archive auto-restore?** Archives are extremely common in Downloads, so quarantining every zip adds friction. Options: auto-restore clean archives by default, or skip archives that contain no executable content at all.
+- **Archives without executable content** are extremely common in Downloads. Analysing them is cheap, but should they be indexed at all, or skipped once enumeration finds nothing executable?
 - **Tar streaming cost** for large `.tar.xz` source tarballs (single-threaded xz). Cap them, or only enumerate?
 - **Encrypted zips with a password in the filename or next to them.** Try "infected" / "malware" / a password taken from the filename? That's useful for analysts but surprising for end users; maybe behind a flag.
 - **Windows** has no Gatekeeper analogue for extracted content. We could add Mark-of-the-Web propagation checks (does the archive carry `Zone.Identifier`, and did the extractor propagate it?).

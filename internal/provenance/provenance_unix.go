@@ -8,6 +8,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/danczar/binchk/internal/analyze"
+	"github.com/danczar/binchk/internal/bplist"
 )
 
 func getxattr(path, name string) []byte {
@@ -28,7 +29,7 @@ func read(path string) analyze.Provenance {
 		}
 	}
 	if w := getxattr(path, "com.apple.metadata:kMDItemWhereFroms"); w != nil {
-		urls := bplistStrings(w)
+		urls := bplist.Strings(w)
 		if len(urls) > 0 {
 			p.Source = urls[0]
 		}

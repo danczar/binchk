@@ -1,12 +1,17 @@
-// Package app ties the pipeline together: watcher -> quarantine -> analysis
-// -> report -> notification. The tray and headless modes both drive it.
+// Package app ties the pipeline together: watcher -> analysis (in place) ->
+// report + index -> Finder tag -> notification. The tray and headless
+// modes both drive it.
 package app
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -18,9 +23,11 @@ import (
 	"github.com/danczar/binchk/internal/analyze"
 	"github.com/danczar/binchk/internal/config"
 	"github.com/danczar/binchk/internal/container"
+	"github.com/danczar/binchk/internal/detect"
+	"github.com/danczar/binchk/internal/index"
+	"github.com/danczar/binchk/internal/legacy"
 	"github.com/danczar/binchk/internal/notify"
 	"github.com/danczar/binchk/internal/provenance"
-	"github.com/danczar/binchk/internal/quarantine"
 	"github.com/danczar/binchk/internal/report"
 	"github.com/danczar/binchk/internal/watcher"
 )
@@ -38,25 +45,30 @@ const (
 type Event struct {
 	Kind  EventKind
 	Path  string
-	Entry *quarantine.Entry
+	Entry *index.Entry
 	Err   error
 }
+
+// recentCap bounds the in-memory list of recent reports.
+const recentCap = 50
 
 type App struct {
 	cfg        *config.Config
 	eng        *analyze.Engine
-	allow      *analyze.HashList
-	store      *quarantine.Store
+	rec        *Recorder
 	reportsDir string
 	dataDir    string
 	Log        *log.Logger
 
+	// notifier shows a desktop notification (replaceable in tests).
+	notifier func(title, body, openPath string, u notify.Urgency)
+
 	mu        sync.Mutex
-	items     []*quarantine.Entry // quarantined, newest first
-	latest    *quarantine.Entry   // most recently analysed file (any outcome)
+	recent    []*index.Entry // newest first, analysed after clearedAt
+	clearedAt time.Time
+	latest    *index.Entry // most recently analysed file
 	scanning  map[string]bool
 	paused    bool
-	suppress  map[string]time.Time // restored paths the watcher must ignore
 	listeners []func(Event)
 	sem       chan struct{}
 	cancel    context.CancelFunc
@@ -66,6 +78,11 @@ type App struct {
 func NewEngine(cfg *config.Config) (*analyze.Engine, error) {
 	eng, _, err := newEngine(cfg)
 	return eng, err
+}
+
+// NewEngineAllow is NewEngine that also returns the allowlist it uses.
+func NewEngineAllow(cfg *config.Config) (*analyze.Engine, *analyze.HashList, error) {
+	return newEngine(cfg)
 }
 
 func newEngine(cfg *config.Config) (*analyze.Engine, *analyze.HashList, error) {
@@ -91,7 +108,8 @@ func newEngine(cfg *config.Config) (*analyze.Engine, *analyze.HashList, error) {
 	return eng, allow, err
 }
 
-func New(cfg *config.Config, logToFile bool) (*App, error) {
+// New prepares the app; version is recorded in index entries.
+func New(cfg *config.Config, logToFile bool, version string) (*App, error) {
 	data := cfg.DataPath()
 	if err := os.MkdirAll(data, 0o700); err != nil {
 		return nil, err
@@ -109,27 +127,30 @@ func New(cfg *config.Config, logToFile bool) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	store, err := quarantine.Open(filepath.Join(data, "quarantine"))
+	idx, err := index.Open(data)
 	if err != nil {
 		return nil, err
 	}
 	a := &App{
-		cfg: cfg, eng: eng, allow: allow, store: store, dataDir: data, Log: lg,
+		cfg: cfg, eng: eng, dataDir: data, Log: lg,
+		rec:        &Recorder{Index: idx, Config: cfg, Allow: allow, Version: version},
 		reportsDir: filepath.Join(data, "reports"),
-		scanning:   map[string]bool{}, suppress: map[string]time.Time{},
-		sem: make(chan struct{}, cfg.ConcurrentScans),
+		notifier:   notify.Show,
+		scanning:   map[string]bool{},
+		sem:        make(chan struct{}, cfg.ConcurrentScans),
 	}
-	a.items, _ = store.List()
-	if len(a.items) > 0 {
-		a.latest = a.items[0]
+	a.clearedAt = a.loadState().RecentClearedAt
+	a.recent, _ = idx.Recent(recentCap, a.clearedAt)
+	if len(a.recent) > 0 {
+		a.latest = a.recent[0]
 	}
 	return a, nil
 }
 
 func (a *App) Config() *config.Config { return a.cfg }
 func (a *App) DataDir() string        { return a.dataDir }
-func (a *App) QuarantineDir() string  { return a.store.Dir() }
 func (a *App) ReportsDir() string     { return a.reportsDir }
+func (a *App) Index() *index.Index    { return a.rec.Index }
 
 // Subscribe registers fn for UI events. fn is called from worker goroutines.
 func (a *App) Subscribe(fn func(Event)) {
@@ -148,9 +169,17 @@ func (a *App) emit(ev Event) {
 }
 
 // Start begins watching. It returns once the watches are established.
+//
+// Items left in a v0.1.x quarantine vault are first returned to their
+// original folders, before the watcher records what is already there, and
+// are then analysed in place explicitly.
 func (a *App) Start() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.cancel = cancel
+	restored, err := legacy.Migrate(a.dataDir, a.Log)
+	if err != nil {
+		a.Log.Printf("legacy migration incomplete: %v", err)
+	}
 	w, err := watcher.New(a.cfg.WatchDirs, time.Duration(a.cfg.SettleDelay), a.cfg.IgnoreExtensions, a.isOwnPath, a.Log)
 	if err != nil {
 		return err
@@ -158,19 +187,40 @@ func (a *App) Start() error {
 	go w.Run(ctx)
 	go func() {
 		for f := range w.Found() {
-			if a.Paused() {
-				continue
-			}
-			// Disk images and installers only matter where they can run,
-			// and are only opened when enabled.
-			if f.Format.IsContainer() && (runtime.GOOS != "darwin" || !a.cfg.InspectInstallers || !container.Supported(f.Format)) {
+			if a.Paused() || !a.wants(f.Format) {
 				continue
 			}
 			go a.Handle(f.Path, f.At)
 		}
 	}()
 	a.Log.Printf("binchk started; data in %s", a.dataDir)
+	if len(restored) > 0 {
+		a.announceMigration(restored)
+		for _, r := range restored {
+			if f := detect.SniffPath(r.To); f != detect.Unknown && a.wants(f) {
+				go a.Handle(r.To, time.Now())
+			}
+		}
+	}
 	return nil
+}
+
+// wants reports whether files of format f are analysed here. Disk images,
+// installers and apps only matter where they can run, and are only opened
+// when enabled.
+func (a *App) wants(f detect.Format) bool {
+	return !f.IsContainer() || (runtime.GOOS == "darwin" && a.cfg.InspectInstallers && container.Supported(f))
+}
+
+func (a *App) announceMigration(rs []legacy.Restored) {
+	msg := fmt.Sprintf("%d files were returned to their original folders.", len(rs))
+	if len(rs) == 1 {
+		msg = "1 file was returned to its original folder."
+	}
+	a.Log.Printf("binchk no longer quarantines downloads; %s", msg)
+	if a.cfg.Notifications {
+		a.notifier("binchk no longer quarantines downloads", msg, "", notify.Normal)
+	}
 }
 
 func (a *App) Stop() {
@@ -196,17 +246,27 @@ func (a *App) Paused() bool {
 	return a.paused
 }
 
-// Items returns quarantined entries, newest first.
-func (a *App) Items() []*quarantine.Entry {
+// Recent returns recent reports (not cleared from the menu), newest first.
+func (a *App) Recent() []*index.Entry {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return append([]*quarantine.Entry{}, a.items...)
+	out := make([]*index.Entry, len(a.recent))
+	for i, e := range a.recent {
+		c := *e
+		out[i] = &c
+	}
+	return out
 }
 
-func (a *App) Latest() *quarantine.Entry {
+// Latest is the most recently analysed file, if any.
+func (a *App) Latest() *index.Entry {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.latest
+	if a.latest == nil {
+		return nil
+	}
+	c := *a.latest
+	return &c
 }
 
 func (a *App) Scanning() int {
@@ -215,13 +275,16 @@ func (a *App) Scanning() int {
 	return len(a.scanning)
 }
 
-// Handle runs the full pipeline for one detected file.
+func newID() string {
+	var b [4]byte
+	rand.Read(b[:])
+	return time.Now().Format("20060102-150405") + "-" + hex.EncodeToString(b[:])
+}
+
+// Handle analyses one detected file where it is, then reports, indexes,
+// tags and notifies.
 func (a *App) Handle(path string, detectedAt time.Time) {
 	a.mu.Lock()
-	if until, ok := a.suppress[path]; ok && time.Now().Before(until) {
-		a.mu.Unlock()
-		return
-	}
 	if a.scanning[path] {
 		a.mu.Unlock()
 		return
@@ -235,144 +298,190 @@ func (a *App) Handle(path string, detectedAt time.Time) {
 		a.emit(Event{Kind: ItemsChanged})
 	}()
 
-	if st, err := os.Stat(path); err == nil && a.cfg.MaxFileSize > 0 && st.Size() > a.cfg.MaxFileSize {
+	if st, err := os.Stat(path); err != nil {
+		return // gone already
+	} else if !st.IsDir() && a.cfg.MaxFileSize > 0 && st.Size() > a.cfg.MaxFileSize {
 		a.Log.Printf("skip %s: %d bytes exceeds max_file_size", path, st.Size())
 		return
 	}
 	a.emit(Event{Kind: ScanStarted, Path: path})
 
-	// Provenance must be read before the move in case it crosses volumes
-	// (xattrs / alternate data streams would not survive the copy).
-	prov := provenance.Read(path)
-	entry, err := a.store.Isolate(path)
-	if err != nil {
-		a.Log.Printf("quarantine %s: %v", path, err)
+	// The identity file's state before analysis: if it changes meanwhile,
+	// the pointer will not match and a reader hashes instead.
+	idSt, idErr := IdentityStat(path)
+	id := newID()
+	a.sem <- struct{}{}
+	r := container.AnalyzeWith(context.Background(), a.eng, path, analyze.Meta{
+		ID: id, FileName: filepath.Base(path), OriginalPath: path, Provenance: provenance.Read(path), DetectedAt: detectedAt,
+	}, container.Options{MountImages: a.cfg.InspectInstallers})
+	<-a.sem
+	r.Latency = time.Since(detectedAt)
+	reportPath := filepath.Join(a.reportsDir, id+".html")
+	if err := report.Write(r, reportPath); err != nil {
+		a.Log.Printf("report %s: %v", id, err)
 		a.emit(Event{Kind: ScanFailed, Path: path, Err: err})
 		return
 	}
-	a.sem <- struct{}{}
-	r := container.AnalyzeWith(context.Background(), a.eng, entry.StoredPath, analyze.Meta{
-		ID: entry.ID, FileName: entry.Name, OriginalPath: path, Provenance: prov, DetectedAt: detectedAt,
-	}, container.Options{MountImages: a.cfg.InspectInstallers})
-	<-a.sem
-	entry.SHA256, entry.Verdict, entry.Score, entry.Summary = r.Hashes.SHA256, string(r.Verdict), r.Score, r.Summary
-	entry.ReportPath = filepath.Join(a.reportsDir, entry.ID+".html")
-	r.Latency = time.Since(detectedAt)
-	if err := report.Write(r, entry.ReportPath); err != nil {
-		a.Log.Printf("report %s: %v", entry.ID, err)
+	if err := report.WriteJSON(r, filepath.Join(a.reportsDir, id+".json")); err != nil {
+		a.Log.Printf("report %s: %v", id, err)
 	}
-	_ = report.WriteJSON(r, filepath.Join(a.reportsDir, entry.ID+".json"))
-	_ = a.store.Save(entry)
+	if idErr != nil {
+		idSt = nil
+	}
+	e, err := a.rec.Record(r, path, reportPath, idSt)
+	if err != nil {
+		a.Log.Printf("index %s: %v", path, err)
+	}
 	a.Log.Printf("%s %s score=%d in %s (latency %s): %s", r.Verdict, path, r.Score,
 		r.Elapsed.Round(time.Millisecond), r.Latency.Round(time.Millisecond), r.Summary)
 
-	_, allowlisted := a.allow.Lookup(r.Hashes.SHA256)
-	autoRestore := allowlisted || (a.cfg.AutoRestoreClean && r.Verdict == analyze.VerdictClean)
 	a.mu.Lock()
-	a.latest = entry
-	if !autoRestore {
-		a.items = append([]*quarantine.Entry{entry}, a.items...)
-	}
+	a.latest = e
+	a.recent = insertRecent(a.recent, e)
 	a.mu.Unlock()
-	if autoRestore {
-		if _, err := a.restore(entry); err != nil {
-			a.Log.Printf("auto-restore %s: %v", path, err)
-		}
-	}
-	a.emit(Event{Kind: ScanFinished, Path: path, Entry: entry})
-	if a.cfg.Notifications && !allowlisted {
-		a.notify(entry, autoRestore)
+	ec := *e // listeners get their own copy; MarkSafe updates e
+	a.emit(Event{Kind: ScanFinished, Path: path, Entry: &ec})
+	if !e.MarkedSafe && a.cfg.Notifies(e.Verdict) {
+		a.notify(e, r)
 	}
 }
 
-func (a *App) notify(e *quarantine.Entry, restored bool) {
-	title := fmt.Sprintf("%s: %s", e.Verdict, e.Name)
-	body := e.Summary
-	if restored {
-		body += " (restored)"
-	} else {
-		body += " — quarantined; click to view the report."
+// insertRecent puts e first, dropping an older entry for the same content
+// (or, for unhashed results, the same path).
+func insertRecent(list []*index.Entry, e *index.Entry) []*index.Entry {
+	out := make([]*index.Entry, 0, len(list)+1)
+	out = append(out, e)
+	for _, o := range list {
+		if (e.SHA256 != "" && o.SHA256 == e.SHA256) || (e.SHA256 == "" && o.SHA256 == "" && o.Path == e.Path) {
+			continue
+		}
+		out = append(out, o)
 	}
+	if len(out) > recentCap {
+		out = out[:recentCap]
+	}
+	return out
+}
+
+func (a *App) notify(e *index.Entry, r *analyze.Report) {
+	title := fmt.Sprintf("%s: %s", e.Verdict, e.FileName)
+	body := NotificationBody(r)
 	u := notify.Normal
 	if e.Verdict == string(analyze.VerdictMalicious) {
 		u = notify.Critical
 	}
-	notify.Show(title, body, e.ReportPath, u)
+	a.notifier(title, body, e.ReportPath, u)
 }
 
-// Restore returns an item to its original location and trusts its hash so
-// the same file is not quarantined again.
-func (a *App) Restore(id string) (string, error) {
-	e := a.take(id)
-	if e == nil {
-		return "", errors.New("no such item")
+// NotificationBody says what stood out, without promising that clicking
+// the notification does anything (it cannot on every platform).
+func NotificationBody(r *analyze.Report) string {
+	counts := map[analyze.Severity]int{}
+	for _, f := range r.Findings {
+		counts[f.Severity]++
 	}
-	dst, err := a.restore(e)
+	var parts []string
+	for _, sev := range []analyze.Severity{analyze.Critical, analyze.High, analyze.Medium} {
+		if n := counts[sev]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", n, sev))
+		}
+		if len(parts) == 2 {
+			break
+		}
+	}
+	what := fmt.Sprintf("Risk %d/100", r.Score)
+	if len(parts) > 0 {
+		n := counts[analyze.Critical] + counts[analyze.High] + counts[analyze.Medium]
+		what = strings.Join(parts, ", ") + " finding"
+		if n != 1 {
+			what += "s"
+		}
+	}
+	if r.Verdict == analyze.VerdictError {
+		what = r.Summary
+	}
+	return what + ". Open binchk ▸ Recent reports."
+}
+
+// MarkSafe trusts a file's content: its hash joins the allowlist, binchk's
+// Finder tag comes off and its index entry says it was marked safe.
+func (a *App) MarkSafe(sha string) error {
+	if !index.IsDigest(sha) {
+		return errors.New("no content hash to mark as safe")
+	}
+	e, err := a.rec.Index.Get(sha)
 	if err != nil {
-		a.put(e)
-		return "", err
-	}
-	if e.SHA256 != "" {
-		if err := a.allow.Add(e.SHA256, "restored by user: "+e.Name); err != nil {
-			a.Log.Printf("allowlist: %v", err)
-		}
-	}
-	a.Log.Printf("restored %s -> %s", e.Name, dst)
-	a.emit(Event{Kind: ItemsChanged})
-	return dst, nil
-}
-
-func (a *App) restore(e *quarantine.Entry) (string, error) {
-	// Suppress the watcher event the move back will generate. The path may
-	// get a " (restored N)" suffix, so suppress the original too.
-	a.mu.Lock()
-	until := time.Now().Add(10*time.Second + time.Duration(a.cfg.SettleDelay))
-	a.suppress[e.OriginalPath] = until
-	a.mu.Unlock()
-	dst, err := a.store.Restore(e)
-	if err == nil {
-		a.mu.Lock()
-		a.suppress[dst] = until
-		for p, t := range a.suppress {
-			if time.Now().After(t) {
-				delete(a.suppress, p)
-			}
-		}
-		a.mu.Unlock()
-	}
-	return dst, err
-}
-
-// Delete permanently removes a quarantined file. Its report is kept.
-func (a *App) Delete(id string) error {
-	e := a.take(id)
-	if e == nil {
-		return errors.New("no such item")
-	}
-	if err := a.store.Delete(e); err != nil {
-		a.put(e)
 		return err
 	}
-	a.Log.Printf("deleted %s", e.Name)
-	a.emit(Event{Kind: ItemsChanged})
-	return nil
-}
-
-func (a *App) take(id string) *quarantine.Entry {
+	if err := a.rec.Allow.Add(sha, "marked safe: "+e.FileName); err != nil {
+		return fmt.Errorf("allowlist: %w", err)
+	}
+	if e, err = a.rec.Index.SetMarkedSafe(sha, true); err != nil {
+		return err
+	}
+	if err := a.rec.untag(e.Path); err != nil {
+		a.Log.Printf("finder tag %s: %v", e.Path, err)
+	}
+	a.Log.Printf("marked safe: %s (%s)", e.Path, sha)
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	for i, e := range a.items {
-		if e.ID == id {
-			a.items = append(a.items[:i:i], a.items[i+1:]...)
-			return e
+	for _, r := range a.recent {
+		if r.SHA256 == sha {
+			r.MarkedSafe = true
 		}
 	}
+	if a.latest != nil && a.latest.SHA256 == sha {
+		a.latest.MarkedSafe = true
+	}
+	a.mu.Unlock()
+	a.emit(Event{Kind: ItemsChanged})
 	return nil
 }
 
-func (a *App) put(e *quarantine.Entry) {
+// ClearRecent hides every current entry from the recent list. Reports and
+// the index are kept.
+func (a *App) ClearRecent() error {
 	a.mu.Lock()
-	a.items = append([]*quarantine.Entry{e}, a.items...)
+	a.clearedAt = time.Now().UTC().Truncate(time.Second)
+	a.recent = nil
+	st := state{RecentClearedAt: a.clearedAt}
 	a.mu.Unlock()
+	err := a.saveState(st)
 	a.emit(Event{Kind: ItemsChanged})
+	return err
+}
+
+// state is binchk's own small settings file, <data>/state.json.
+type state struct {
+	RecentClearedAt time.Time `json:"recent_cleared_at"`
+}
+
+func (a *App) statePath() string { return filepath.Join(a.dataDir, "state.json") }
+
+func (a *App) loadState() state {
+	var s state
+	if b, err := os.ReadFile(a.statePath()); err == nil {
+		_ = json.Unmarshal(b, &s)
+	}
+	return s
+}
+
+func (a *App) saveState(s state) error {
+	b, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := a.statePath() + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, a.statePath())
+}
+
+// IdentityStat returns the state of the file whose hash identifies path:
+// the file itself, or an app bundle's main executable.
+func IdentityStat(path string) (fs.FileInfo, error) {
+	if detect.IsAppBundle(path) {
+		return os.Stat(container.MainExecutable(path))
+	}
+	return os.Stat(path)
 }

@@ -85,7 +85,6 @@ footer{margin-top:40px;color:var(--muted);font-size:12px;text-align:center}
       <span>analysed in <b>{{ms .Elapsed}}</b>{{if .Latency}} · report ready <b>{{ms .Latency}}</b> after detection{{end}}</span>
       <span>{{time .AnalyzedAt}}</span>
     </div>
-    {{if ne .StoredPath .OriginalPath}}<div class="note">🔒 Quarantined from <code>{{.OriginalPath}}</code>. Use the <b>binchk</b> menu to <b>Restore</b> or <b>Delete</b> it.</div>{{end}}
     {{if .Truncated}}<div class="note">⏱ Analysis reached its time budget; some checks are incomplete.</div>{{end}}
   </div>
   <div class="gauge" style="--score:{{.Score}}"><div><span><b>{{.Score}}</b><br><small>risk / 100</small></span></div></div>
@@ -148,8 +147,7 @@ footer{margin-top:40px;color:var(--muted);font-size:12px;text-align:center}
   <tr><td class="k">SHA-1</td><td class="mono hash" title="Click to copy">{{.Hashes.SHA1}}</td></tr>
   <tr><td class="k">MD5</td><td class="mono hash" title="Click to copy">{{.Hashes.MD5}}</td></tr>
   {{if .Hashes.Imphash}}<tr><td class="k">Imphash</td><td class="mono hash" title="Click to copy">{{.Hashes.Imphash}}</td></tr>{{end}}
-  <tr><td class="k">Original path</td><td class="mono">{{.OriginalPath}}</td></tr>
-  {{if ne .StoredPath .OriginalPath}}<tr><td class="k">Quarantine</td><td class="mono">{{.StoredPath}}</td></tr>{{end}}
+  <tr><td class="k">Path</td><td class="mono">{{.OriginalPath}}</td></tr>
   <tr><td class="k">Detected</td><td>{{time .DetectedAt}}</td></tr>
   {{with .Provenance}}
     {{if .Source}}<tr><td class="k">Downloaded from</td><td class="mono">{{.Source}}</td></tr>{{end}}

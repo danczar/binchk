@@ -135,3 +135,32 @@ func TestUnreadableTagsLeftAlone(t *testing.T) {
 		t.Fatalf("attribute changed: %q", buf[:n])
 	}
 }
+
+// Read-only downloads (and read-only app bundles) are still tagged, and keep
+// their exact mode afterwards.
+func TestReadOnlyStillTagged(t *testing.T) {
+	d := t.TempDir()
+	f := filepath.Join(d, "ro.bin")
+	os.WriteFile(f, []byte("x"), 0o444)
+	os.Chmod(f, 0o444)
+	app := filepath.Join(d, "RO.app")
+	os.MkdirAll(filepath.Join(app, "Contents"), 0o755)
+	os.Chmod(app, 0o555)
+	defer os.Chmod(app, 0o755)
+	for _, p := range []string{f, app} {
+		before, _ := os.Stat(p)
+		if err := Set(p, "Malicious"); err != nil {
+			t.Fatalf("%s: %v", p, err)
+		}
+		if got := mustGet(t, p); len(got) != 1 || got[0] != "binchk: Malicious\n6" {
+			t.Errorf("%s: tags %q", p, got)
+		}
+		if err := Clear(p); err != nil {
+			t.Fatalf("%s clear: %v", p, err)
+		}
+		after, _ := os.Stat(p)
+		if after.Mode() != before.Mode() || !after.ModTime().Equal(before.ModTime()) {
+			t.Errorf("%s: mode/mtime changed: %v %v -> %v %v", p, before.Mode(), before.ModTime(), after.Mode(), after.ModTime())
+		}
+	}
+}

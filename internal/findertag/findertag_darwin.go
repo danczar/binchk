@@ -3,6 +3,7 @@ package findertag
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -92,19 +93,49 @@ func set(path, verdict string) error {
 		return err
 	}
 	tags, changed := merge(existing, verdict)
-	switch {
-	case !changed:
+	if !changed {
 		return nil
-	case len(tags) == 0 && present:
-		err = unix.Fremovexattr(fd, attrName)
-		if errors.Is(err, unix.ENOATTR) {
-			err = nil
+	}
+	write := func() error {
+		if len(tags) == 0 && present {
+			if err := unix.Fremovexattr(fd, attrName); err != nil && !errors.Is(err, unix.ENOATTR) {
+				return err
+			}
+			return nil
 		}
-	default:
-		err = unix.Fsetxattr(fd, attrName, bplist.EncodeStrings(tags), 0)
+		return unix.Fsetxattr(fd, attrName, bplist.EncodeStrings(tags), 0)
+	}
+	err = write()
+	if errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM) {
+		err = withOwnerWrite(fd, write)
 	}
 	if err != nil {
 		return fmt.Errorf("findertag %s: %w", path, err)
 	}
 	return nil
+}
+
+// withOwnerWrite runs f with owner write permission temporarily added to
+// fd, then restores the exact original mode. Extended attributes need write
+// permission, and a read-only download (easy to produce from an archive)
+// must not be able to dodge its tag. Only files owned by the user are
+// touched; immutable flags are never changed. Working on the open fd means
+// no path can be swapped in between.
+func withOwnerWrite(fd int, f func() error) error {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if int(st.Uid) != os.Getuid() || st.Mode&unix.S_IWUSR != 0 {
+		return f()
+	}
+	orig := uint32(st.Mode & 0o7777)
+	if err := unix.Fchmod(fd, orig|unix.S_IWUSR); err != nil {
+		return err
+	}
+	ferr := f()
+	if err := unix.Fchmod(fd, orig); err != nil && ferr == nil {
+		ferr = err
+	}
+	return ferr
 }

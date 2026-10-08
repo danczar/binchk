@@ -226,3 +226,35 @@ func TestRecent(t *testing.T) {
 		t.Fatalf("since: %+v", got)
 	}
 }
+
+// The signing line only appears where code signing applies, and the
+// notarization note only for Apple formats.
+func TestCardSigningLine(t *testing.T) {
+	x, _ := Open(t.TempDir())
+	for _, c := range []struct {
+		format       string
+		sign, notary bool
+	}{
+		{"ELF", false, false},
+		{"script", false, false},
+		{"PE", true, false},
+		{"Mach-O", true, true},
+		{"Application bundle", true, true},
+	} {
+		sha := digest("sig-" + c.format)
+		r := sampleReport("f", sha, time.Now())
+		r.Format = c.format
+		r.Signature = analyze.Signature{}
+		if err := x.Put(NewEntry(r, "/d/f", "/r/f.html", "v", false), Extra{}); err != nil {
+			t.Fatal(err)
+		}
+		b, _ := os.ReadFile(x.CardPath(sha))
+		card := string(b)
+		if got := strings.Contains(card, "Not signed by an identified developer"); got != c.sign {
+			t.Errorf("%s: signing line shown = %v, want %v", c.format, got, c.sign)
+		}
+		if got := strings.Contains(card, "otarized"); got != c.notary {
+			t.Errorf("%s: notarization shown = %v, want %v", c.format, got, c.notary)
+		}
+	}
+}

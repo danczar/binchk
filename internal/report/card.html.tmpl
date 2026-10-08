@@ -49,11 +49,11 @@ footer{margin-top:12px;padding-top:8px;border-top:1px solid var(--line);color:va
     <div class="score"><b>{{.Score}}</b><small>risk / 100</small></div>
   </div>
   {{if .Summary}}<p class="summary">{{.Summary}}</p>{{end}}
-  <div class="sig">
+  {{if .Signable}}<div class="sig">
     {{if .Signer}}Signed by <b>{{.Signer}}</b>{{else}}<span class="bad">Not signed by an identified developer</span>{{end}}
-    · {{if .Notarized}}<span class="ok">Notarized</span>{{else}}Not notarized{{end}}
+    {{if .Notarizable}}· {{if .Notarized}}<span class="ok">Notarized</span>{{else}}Not notarized{{end}}{{end}}
     {{if .Gatekeeper}}· Gatekeeper: {{.Gatekeeper}}{{end}}
-  </div>
+  </div>{{end}}
   {{if .MarkedSafe}}<div class="safe">✓ You marked this file as safe.</div>{{end}}
   {{if .Findings}}<ul>
   {{range .Findings}}<li><span class="chip s-{{.Severity}}">{{.Severity}}</span><span>{{.Title}}</span></li>

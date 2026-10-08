@@ -42,6 +42,19 @@ type CardData struct {
 	Version    string
 }
 
+// Signable reports whether code signing applies to the format at all;
+// scripts and ELF files have no signature to show.
+func (c *CardData) Signable() bool {
+	switch c.Format {
+	case "Mach-O", "Mach-O (universal)", "PE", "Application bundle", "Apple disk image", "Installer package":
+		return true
+	}
+	return false
+}
+
+// Notarizable reports whether Apple notarization applies to the format.
+func (c *CardData) Notarizable() bool { return c.Signable() && c.Format != "PE" }
+
 // WriteCard renders the compact, self-contained card shown by Quick Look:
 // inline CSS only, no scripts, no external resources.
 func WriteCard(w io.Writer, c *CardData) error {

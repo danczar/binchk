@@ -167,6 +167,9 @@ do {
 
     check(idx.preview(forPath: files + "/does-not-exist").outcome == .notChecked(.unreadable), "nonexistent file")
     check(BinchkIndex(indexDir: base + "/nope").preview(forPath: f).outcome == .notChecked(.noEntry), "no index at all")
+    var noIndex = BinchkIndex(indexDir: base + "/nope")
+    noIndex.maxHashBytes = 1 // would report tooLarge if it got as far as hashing
+    check(noIndex.preview(forPath: f).outcome == .notChecked(.noEntry), "no index: file is never hashed")
 }
 
 // 5. Oversized or invalid index entries.

@@ -111,6 +111,11 @@ struct BinchkIndex: Sendable {
                 return .indexed(sha256: sha, via: .pointer)
             }
         }
+        // Without an index nothing can match, so don't read the whole file.
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: indexDir, isDirectory: &isDir), isDir.boolValue else {
+            return .notChecked(.noEntry)
+        }
         if st.size > maxHashBytes {
             return .notChecked(.tooLarge)
         }

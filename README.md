@@ -118,6 +118,10 @@ make all          # cross-build darwin / linux / windows × amd64 / arm64
 make release      # macOS: release archives + SHA256SUMS in dist/release
 ```
 
+On macOS, `make app` and `make release` also build the Quick Look extension
+with `swiftc`, which comes with the Xcode Command Line Tools
+(`xcode-select --install`); full Xcode isn't needed.
+
 ## Usage
 
 ```bash
@@ -149,6 +153,19 @@ re-analysed as clean, or that you mark as safe, loses the tag.
 Select a file in Finder to see its binchk card in the preview pane or with
 Space: verdict, risk score, signer and notarization, and the top findings.
 Files binchk hasn't looked at show "Not checked by binchk".
+
+The card comes from a Quick Look extension inside `binchk.app`:
+
+- macOS registers it when you first launch `binchk.app`, or move it into
+  `/Applications`. If the card doesn't appear, turn binchk on under
+  **System Settings → General → Login Items & Extensions → Quick Look**.
+- It covers executables, Mach-O and Windows binaries, `.app` bundles, disk
+  images and installer packages. macOS treats a downloaded binary that has no
+  execute bit and no telling extension as plain data, and never asks the
+  extension about it. Its report is still in the tray menu.
+- The extension is sandboxed and reads only binchk's index in
+  `~/Library/Application Support/binchk/index`. If you move the data folder
+  with `data_dir`, cards will show "Not checked".
 
 ### Upgrading from v0.1
 
@@ -278,6 +295,7 @@ internal/bplist       minimal binary property list reader and writer
 internal/legacy       one-time return of files held in the v0.1 vault
 internal/tray         menu-bar / tray UI
 internal/report       self-contained HTML report and Quick Look card
+macos/QuickLook       Swift Quick Look extension that shows the card in Finder
 internal/notify       native notifications (toast, notify-send, macOS)
 internal/provenance   download origin (kMDItemWhereFroms, xdg.origin.url, Zone.Identifier)
 tools/mkicon          renders the app icon
@@ -291,6 +309,7 @@ make test     # go test -race ./...
 make bench    # matcher and engine benchmarks
 make rules    # re-embed internal/analyze/rules/builtin.json after editing it
 make icons    # re-render the icon and the Windows resources
+make quicklook-test  # macOS: index lookup tests for the Quick Look extension
 ```
 
 The test suite builds inert "malware-looking" samples for all three OSes, plus

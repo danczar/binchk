@@ -14,7 +14,7 @@ DARWIN_ENV := MACOSX_DEPLOYMENT_TARGET=$(MACOS_MIN) \
 
 REL := dist/release
 
-.PHONY: build all darwin linux windows app release icons test bench rules clean
+.PHONY: build all darwin linux windows quicklook quicklook-test app release icons test bench rules clean
 
 build:            ## native build for this machine
 	go build -trimpath -ldflags "$(LDFLAGS)" -o bin/binchk $(PKG)
@@ -42,8 +42,22 @@ windows:          ## pure Go; -H=windowsgui hides the console; icon via cmd/binc
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS) -H=windowsgui" -o dist/binchk-windows-amd64.exe $(PKG)
 	GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS) -H=windowsgui" -o dist/binchk-windows-arm64.exe $(PKG)
 
-app: darwin       ## macOS menu-bar .app bundle
-	MACOS_MIN=$(MACOS_MIN) scripts/macos-bundle.sh dist/binchk-darwin $(VERSION)
+# Quick Look preview extension (Swift, Command Line Tools only). The app
+# bundle embeds it at Contents/PlugIns/BinchkPreview.appex.
+QL       := macos/QuickLook
+QL_APPEX := dist/BinchkPreview.appex
+
+quicklook:        ## macOS: universal, ad-hoc signed $(QL_APPEX)
+	MACOS_MIN=$(MACOS_MIN) $(QL)/build.sh $(QL_APPEX) $(VERSION)
+
+quicklook-test:   ## macOS: index lookup tests for the preview extension
+	@mkdir -p dist/quicklook-test
+	swiftc -swift-version 6 -target $$(uname -m)-apple-macos$(MACOS_MIN) \
+		-o dist/quicklook-test/run $(QL)/Sources/Core/BinchkIndex.swift $(QL)/Tests/main.swift
+	dist/quicklook-test/run "$${TMPDIR:-/tmp}"
+
+app: darwin quicklook   ## macOS menu-bar .app bundle
+	MACOS_MIN=$(MACOS_MIN) APPEX=$(QL_APPEX) scripts/macos-bundle.sh dist/binchk-darwin $(VERSION)
 
 # Release assets in $(REL); build on a Mac, then upload by hand. Timestamps
 # come from the last commit and owners are zeroed so reruns are byte-identical.

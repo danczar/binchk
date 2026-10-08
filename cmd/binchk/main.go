@@ -166,6 +166,7 @@ func scan(args []string) int {
 		r := container.Analyze(context.Background(), eng, abs, analyze.Meta{
 			ID:         fmt.Sprintf("scan-%s-%s", time.Now().Format("20060102-150405"), sanitize(filepath.Base(abs))),
 			Provenance: provenance.Read(abs), DetectedAt: t0,
+			FullBundleDigest: true, // a scan you started may take longer than a download check
 		})
 		html := filepath.Join(dir, r.ID+".html")
 		if err := report.Write(r, html); err != nil {

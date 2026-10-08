@@ -374,3 +374,35 @@ func TestAdHocAppEngineNotDemoted(t *testing.T) {
 		t.Fatalf("framework not analysed or has no engine findings: %+v", r.Container.Files)
 	}
 }
+
+// A download's report never waits past the analysis budget for an app's
+// contents digest; a user-initiated scan (FullBundleDigest) does.
+func TestBundleDigestWaitsOnlyForScans(t *testing.T) {
+	d := t.TempDir()
+	app := makeApp(t, d, "Big", evilBinary(t, d))
+	big, err := os.Create(filepath.Join(app, "Contents", "Resources.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	big.Truncate(2 << 30) // sparse: cheap to create, slow to hash
+	big.Close()
+	eng, err := analyze.NewEngine(analyze.Options{Budget: 500 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Now()
+	r := Analyze(context.Background(), eng, app, analyze.Meta{})
+	if el := time.Since(t0); el > 3*time.Second {
+		t.Errorf("download analysis took %v with a 500ms budget", el)
+	}
+	if r.Hashes.BundleContents != "" {
+		t.Error("contents digest unexpectedly finished within the budget")
+	}
+	if _, ok := ids(r)["bundle-contents-unhashed"]; !ok {
+		t.Errorf("missing bundle-contents-unhashed: %v", ids(r))
+	}
+	r = Analyze(context.Background(), eng, app, analyze.Meta{FullBundleDigest: true})
+	if r.Hashes.BundleContents == "" {
+		t.Errorf("scan mode did not wait for the contents digest: %v", ids(r))
+	}
+}

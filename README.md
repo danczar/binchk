@@ -285,7 +285,9 @@ different fingerprints. The fingerprint does not cover the bytes of nested
 files: Quick Look must compute it quickly, from metadata. It tells items apart
 in the index; it is never used to trust anything. An entry's `trust_key` is
 what *Mark as safe* uses: the file's SHA-256, or the app's bundle contents
-digest (empty if it could not be computed).
+digest (empty if it could not be computed). Checking a download never waits
+past the analysis time budget for that digest, so a very large app may get
+none; `binchk scan` waits for it, after which the app can be marked as safe.
 
 Each **entry** is one analysis of one item at one path:
 `<id>` = SHA-256 of `"v2\0" + absolute path + "\0" + content key`. Analysing
@@ -300,8 +302,11 @@ app, the same number of entries, total size and newest modification time in
 the bundle, and the same main executable size and modification time. Otherwise
 it computes the content key and uses the **content map**, which names the most
 recent analysis of the same content, possibly under another name or folder.
-Quick Look then shows that card with a banner saying where and when it was
-analysed. Apps too large to walk quickly (over 200,000 entries) and files over
+Quick Look then shows that card under a "Not checked at this location"
+banner that says where and when it was analysed. For a file the match is
+exact (same SHA-256). For an app it only means the same file names and
+sizes, so the banner says the contents were not compared; run `binchk scan`
+on the app to check that copy. Apps too large to walk quickly (over 200,000 entries) and files over
 1 GiB without a matching pointer show "Not checked".
 
 Files are written atomically, named only by hex digests, and every JSON file

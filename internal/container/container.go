@@ -158,10 +158,12 @@ func analyzeContainer(parent context.Context, eng *analyze.Engine, path string, 
 		err       error
 	}
 	var contents chan digest
+	stopDigest := func() {}
 	if f == detect.AppBundle && hashOK {
 		contents = make(chan digest, 1)
+		cctx, cancel := context.WithTimeout(parent, max(eng.Budget(), contentsTimeout))
+		stopDigest = cancel
 		go func() {
-			cctx, cancel := context.WithTimeout(parent, max(eng.Budget(), contentsTimeout))
 			defer cancel()
 			var d digest
 			d.sum, d.main, d.err = bundleid.Contents(cctx, path, filepath.Base(hashTarget))
@@ -209,7 +211,20 @@ func analyzeContainer(parent context.Context, eng *analyze.Engine, path string, 
 	}
 	if contents != nil {
 		t0 := time.Now()
-		d := <-contents
+		// A download's report must not wait past the analysis deadline: a
+		// very large app gets no trust key now (so no allowlist match, the
+		// safe default) and the user can run binchk scan to hash it fully.
+		wait := ctx.Done()
+		if meta.FullBundleDigest {
+			wait = nil // the digest has its own, longer deadline
+		}
+		var d digest
+		select {
+		case d = <-contents:
+		case <-wait:
+			d.err = errors.New("not finished within the analysis time budget")
+		}
+		stopDigest()
 		switch {
 		case d.err != nil:
 		case r.Hashes.SHA256 == "":
@@ -222,7 +237,7 @@ func analyzeContainer(parent context.Context, eng *analyze.Engine, path string, 
 			r.Hashes.BundleContents = d.sum
 		} else {
 			in.add(analyze.Finding{ID: "bundle-contents-unhashed", Title: "App bundle's contents were not fully hashed",
-				Detail:   "binchk could not read every file in it, so it cannot be matched by the allowlist or marked as safe. Analyse it again once it has stopped changing.",
+				Detail:   "binchk could not hash every file in it, because it is very large or was changing, so it cannot be matched by the allowlist or marked as safe. Run binchk scan on it to hash it fully.",
 				Severity: analyze.Info, Category: "engine", Evidence: []string{d.err.Error()}})
 		}
 	}

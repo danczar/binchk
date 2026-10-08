@@ -243,12 +243,14 @@ func hashRegular(ctx context.Context, p string) (string, error) {
 	if !st.Mode().IsRegular() {
 		return "", errors.New("bundleid: " + p + " is no longer a regular file")
 	}
-	f, err := os.Open(p)
+	// Not following links and not blocking: a file swapped for a symlink or
+	// a FIFO after the Lstat above must not be read through or hang.
+	f, err := openNoFollow(p)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-	if fst, err := f.Stat(); err != nil || !os.SameFile(st, fst) {
+	if fst, err := f.Stat(); err != nil || !fst.Mode().IsRegular() || !os.SameFile(st, fst) {
 		return "", errors.New("bundleid: " + p + " changed while reading")
 	}
 	h := sha256.New()

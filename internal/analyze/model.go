@@ -260,4 +260,9 @@ type Meta struct {
 	// EnginePending, and the container calls ConfirmBrowserEngine once the
 	// seal has verified. Loose files in a container are never pending.
 	Sealed bool
+	// FullBundleDigest makes the analysis of an app bundle wait for the
+	// digest of every file in it (the bundle's trust key) instead of giving
+	// up at the analysis deadline. Set for user-initiated scans, where a
+	// large app may take longer than the budget meant for downloads.
+	FullBundleDigest bool
 }

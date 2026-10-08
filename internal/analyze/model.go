@@ -166,7 +166,6 @@ type Report struct {
 	ID           string     `json:"id"`
 	FileName     string     `json:"file_name"`
 	OriginalPath string     `json:"original_path"`
-	StoredPath   string     `json:"stored_path"`
 	Size         int64      `json:"size"`
 	Format       string     `json:"format"`
 	Arches       []string   `json:"arches,omitempty"`

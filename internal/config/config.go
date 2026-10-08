@@ -39,17 +39,24 @@ type WatchDir struct {
 type Config struct {
 	WatchDirs []WatchDir `json:"watch_dirs"`
 	// AnalysisBudget is the hard deadline for one analysis. The whole
-	// pipeline (settle -> quarantine -> analyse -> report) targets < 15s.
+	// pipeline (settle -> analyse -> report) targets < 15s.
 	AnalysisBudget Duration `json:"analysis_budget"`
 	// SettleDelay: a file must be unchanged this long before it is scanned,
 	// so half-written downloads are not analysed.
-	SettleDelay      Duration `json:"settle_delay"`
-	MaxFileSize      int64    `json:"max_file_size"`
-	ConcurrentScans  int      `json:"concurrent_scans"`
-	AutoRestoreClean bool     `json:"auto_restore_clean"`
-	Notifications    bool     `json:"notifications"`
+	SettleDelay     Duration `json:"settle_delay"`
+	MaxFileSize     int64    `json:"max_file_size"`
+	ConcurrentScans int      `json:"concurrent_scans"`
+	// Notifications enables desktop notifications for the verdicts listed
+	// in NotifyVerdicts.
+	Notifications  bool     `json:"notifications"`
+	NotifyVerdicts []string `json:"notify_verdicts"`
+	// FinderTags (macOS) tags analysed files whose verdict is listed in
+	// TagVerdicts ("binchk: Suspicious", orange). Other verdicts, and files
+	// marked safe, have binchk's tag removed.
+	FinderTags       bool     `json:"finder_tags"`
+	TagVerdicts      []string `json:"tag_verdicts"`
 	VerifySignatures bool     `json:"verify_signatures"`
-	// InspectInstallers: on macOS, also quarantine and inspect disk images
+	// InspectInstallers: on macOS, also inspect app bundles, disk images
 	// (.dmg) and installer packages (.pkg).
 	InspectInstallers bool     `json:"inspect_installers"`
 	IgnoreExtensions  []string `json:"ignore_extensions"`
@@ -71,6 +78,9 @@ func Default() *Config {
 		MaxFileSize:       4 << 30,
 		ConcurrentScans:   2,
 		Notifications:     true,
+		NotifyVerdicts:    []string{"Suspicious", "Malicious"},
+		FinderTags:        true,
+		TagVerdicts:       []string{"Suspicious", "Malicious"},
 		VerifySignatures:  true,
 		InspectInstallers: true,
 		IgnoreExtensions:  []string{".crdownload", ".part", ".partial", ".download", ".tmp", ".opdownload", ".!ut"},
@@ -134,6 +144,25 @@ func (c *Config) Save() error {
 
 func (c *Config) Path() string { return c.path }
 
+// Notifies reports whether a verdict gets a notification.
+func (c *Config) Notifies(verdict string) bool {
+	return c.Notifications && containsFold(c.NotifyVerdicts, verdict)
+}
+
+// Tags reports whether a verdict gets a Finder tag.
+func (c *Config) Tags(verdict string) bool {
+	return c.FinderTags && containsFold(c.TagVerdicts, verdict)
+}
+
+func containsFold(list []string, s string) bool {
+	for _, v := range list {
+		if strings.EqualFold(strings.TrimSpace(v), s) {
+			return true
+		}
+	}
+	return false
+}
+
 // Resolve makes an optional config-relative path absolute ("" stays "").
 func (c *Config) Resolve(p string) string {
 	if p == "" {
@@ -146,7 +175,7 @@ func (c *Config) Resolve(p string) string {
 	return p
 }
 
-// DataPath is where quarantine, reports and state live.
+// DataPath is where reports, the report index and state live.
 func (c *Config) DataPath() string {
 	if c.DataDir != "" {
 		return c.Resolve(c.DataDir)

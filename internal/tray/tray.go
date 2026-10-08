@@ -13,8 +13,8 @@ import (
 	"github.com/danczar/binchk/internal/analyze"
 	"github.com/danczar/binchk/internal/app"
 	"github.com/danczar/binchk/internal/autostart"
+	"github.com/danczar/binchk/internal/index"
 	"github.com/danczar/binchk/internal/opener"
-	"github.com/danczar/binchk/internal/quarantine"
 )
 
 const maxMenuItems = 15
@@ -27,21 +27,32 @@ type itemUI struct {
 type ui struct {
 	a *app.App
 
-	mu        sync.Mutex
-	status    *systray.MenuItem
-	latest    *systray.MenuItem
-	quarMenu  *systray.MenuItem
-	empty     *systray.MenuItem
-	items     []*itemUI
-	shownIDs  []string
-	scanning  string
-	lastError string
+	mu         sync.Mutex
+	status     *systray.MenuItem
+	latest     *systray.MenuItem
+	recentMenu *systray.MenuItem
+	empty      *systray.MenuItem
+	clear      *systray.MenuItem
+	items      []*itemUI
+	shownKeys  []string
+	scanning   string
+	lastError  string
 }
 
 // Run blocks, running the tray event loop on the main thread.
 func Run(a *app.App) {
 	u := &ui{a: a}
 	systray.Run(u.onReady, a.Stop)
+}
+
+func revealLabel() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "Reveal in Finder"
+	case "windows":
+		return "Show in Explorer"
+	}
+	return "Open containing folder"
 }
 
 func (u *ui) onReady() {
@@ -53,14 +64,13 @@ func (u *ui) onReady() {
 	u.latest = systray.AddMenuItem("No files analysed yet", "Open the most recent report")
 	u.latest.Disable()
 	systray.AddSeparator()
-	u.quarMenu = systray.AddMenuItem("Quarantine", "Files held for review")
-	u.empty = u.quarMenu.AddSubMenuItem("Empty", "")
+	u.recentMenu = systray.AddMenuItem("Recent reports", "Files binchk analysed recently")
+	u.empty = u.recentMenu.AddSubMenuItem("None", "")
 	u.empty.Disable()
 	systray.AddSeparator()
 	mPause := systray.AddMenuItemCheckbox("Pause watching", "Stop analysing new files", false)
 	mLogin := systray.AddMenuItemCheckbox("Start at login", "", autostart.Enabled())
 	mReports := systray.AddMenuItem("Open reports folder", "")
-	mQuarDir := systray.AddMenuItem("Open quarantine folder", "")
 	mSettings := systray.AddMenuItem("Edit settings…", "Opens config.json; restart binchk to apply")
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Quit binchk", "")
@@ -101,8 +111,6 @@ func (u *ui) onReady() {
 				}
 			case <-mReports.ClickedCh:
 				opener.Open(u.a.ReportsDir())
-			case <-mQuarDir.ClickedCh:
-				opener.Open(u.a.QuarantineDir())
 			case <-mSettings.ClickedCh:
 				opener.Open(u.a.Config().Path())
 			case <-mQuit.ClickedCh:
@@ -156,12 +164,17 @@ func shorten(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
+// flagged is a recent entry that still deserves attention.
+func flagged(e *index.Entry) bool {
+	return !e.MarkedSafe && (e.Verdict == string(analyze.VerdictMalicious) || e.Verdict == string(analyze.VerdictSuspicious))
+}
+
 // refresh redraws everything from app state. Cheap enough to call on
-// every event; the quarantine submenu is only rebuilt when it changed.
+// every event; the recent-reports submenu is only rebuilt when it changed.
 func (u *ui) refresh() {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	items := u.a.Items()
+	recent := u.a.Recent()
 	latest := u.a.Latest()
 	scanning := u.a.Scanning()
 
@@ -180,9 +193,9 @@ func (u *ui) refresh() {
 
 	tip := "binchk — " + status
 	if latest != nil {
-		u.latest.SetTitle(fmt.Sprintf("%s Latest: %s — %s · Open report", verdictMark(latest.Verdict), shorten(latest.Name, 32), latest.Verdict))
+		u.latest.SetTitle(fmt.Sprintf("%s Latest: %s — %s · Open report", verdictMark(latest.Verdict), shorten(latest.FileName, 32), latest.Verdict))
 		u.latest.Enable()
-		tip = fmt.Sprintf("binchk — %s: %s (risk %d/100)\n%s", latest.Verdict, latest.Name, latest.Score, shorten(latest.Summary, 120))
+		tip = fmt.Sprintf("binchk — %s: %s (risk %d/100)\n%s", latest.Verdict, latest.FileName, latest.Score, shorten(latest.Summary, 120))
 		if runtime.GOOS != "darwin" {
 			tip += "\nClick to open the report."
 		}
@@ -191,59 +204,84 @@ func (u *ui) refresh() {
 		tip = "binchk — analysing " + shorten(u.scanning, 60) + "…"
 	}
 	systray.SetTooltip(tip)
-	u.setIcon(items)
+	u.setIcon(recent)
+	nFlagged := 0
+	for _, e := range recent {
+		if flagged(e) {
+			nFlagged++
+		}
+	}
 	if runtime.GOOS == "darwin" {
-		if len(items) > 0 {
-			systray.SetTitle(fmt.Sprint(len(items)))
+		if nFlagged > 0 {
+			systray.SetTitle(fmt.Sprint(nFlagged))
 		} else {
 			systray.SetTitle("")
 		}
 	}
 
-	// Quarantine submenu
-	u.quarMenu.SetTitle(fmt.Sprintf("Quarantine (%d)", len(items)))
-	ids := make([]string, 0, len(items))
-	for i, e := range items {
-		if i == maxMenuItems {
-			break
-		}
-		ids = append(ids, e.ID+e.Verdict)
+	// Recent reports submenu
+	if nFlagged > 0 {
+		u.recentMenu.SetTitle(fmt.Sprintf("Recent reports (%d flagged)", nFlagged))
+	} else {
+		u.recentMenu.SetTitle("Recent reports")
 	}
-	if slices.Equal(ids, u.shownIDs) {
+	if len(recent) > maxMenuItems {
+		recent = recent[:maxMenuItems]
+	}
+	keys := make([]string, 0, len(recent))
+	for _, e := range recent {
+		keys = append(keys, fmt.Sprintf("%s|%s|%s|%s|%v", e.SHA256, e.Path, e.Verdict, e.AnalyzedAt, e.MarkedSafe))
+	}
+	if slices.Equal(keys, u.shownKeys) && u.shownKeys != nil {
 		return
 	}
-	u.shownIDs = ids
+	u.shownKeys = keys
 	for _, it := range u.items {
 		close(it.done)
 		it.root.Remove()
 	}
 	u.items = nil
-	if len(items) == 0 {
+	if u.clear != nil {
+		u.clear.Remove()
+		u.clear = nil
+	}
+	if len(recent) == 0 {
 		u.empty.Show()
 		return
 	}
 	u.empty.Hide()
-	for i, e := range items {
-		if i == maxMenuItems {
-			break
-		}
+	for _, e := range recent {
 		u.items = append(u.items, u.addItem(e))
 	}
+	u.clear = u.recentMenu.AddSubMenuItem("Clear recent reports", "Hides these entries from the menu; reports are kept")
+	clear := u.clear
+	done := u.items[0].done
+	go func() {
+		select {
+		case <-done:
+		case <-clear.ClickedCh:
+			if err := u.a.ClearRecent(); err != nil {
+				u.a.Log.Printf("clear recent: %v", err)
+			}
+		}
+	}()
 }
 
-func (u *ui) addItem(e *quarantine.Entry) *itemUI {
-	label := fmt.Sprintf("%s %s — %s", verdictMark(e.Verdict), shorten(e.Name, 40), e.Verdict)
-	if e.Verdict == "" {
-		label = "⏳ " + shorten(e.Name, 40) + " — analysing"
+func (u *ui) addItem(e *index.Entry) *itemUI {
+	label := fmt.Sprintf("%s %s — %s", verdictMark(e.Verdict), shorten(e.FileName, 40), e.Verdict)
+	if e.MarkedSafe {
+		label += " · marked safe"
 	}
-	root := u.quarMenu.AddSubMenuItem(label, strings.TrimSpace(e.Summary))
-	info := root.AddSubMenuItem(fmt.Sprintf("Risk %d/100 · from %s", e.Score, shorten(e.OriginalPath, 50)), "")
+	root := u.recentMenu.AddSubMenuItem(label, strings.TrimSpace(e.Summary))
+	info := root.AddSubMenuItem(fmt.Sprintf("Risk %d/100 · %s", e.Score, shorten(e.Path, 50)), "")
 	info.Disable()
 	open := root.AddSubMenuItem("Open report", "")
-	restore := root.AddSubMenuItem("Restore to original location", "Moves the file back and trusts its hash")
-	del := root.AddSubMenuItem("Delete permanently", "")
+	reveal := root.AddSubMenuItem(revealLabel(), "")
+	safe := root.AddSubMenuItem("Mark as safe", "Trust this file's content: allowlists its hash and removes binchk's tag")
+	if e.MarkedSafe || !index.IsDigest(e.SHA256) {
+		safe.Disable()
+	}
 	it := &itemUI{root: root, done: make(chan struct{})}
-	id := e.ID
 	go func() {
 		for {
 			select {
@@ -253,13 +291,13 @@ func (u *ui) addItem(e *quarantine.Entry) *itemUI {
 				if e.ReportPath != "" {
 					opener.Open(e.ReportPath)
 				}
-			case <-restore.ClickedCh:
-				if _, err := u.a.Restore(id); err != nil {
-					u.a.Log.Printf("restore: %v", err)
+			case <-reveal.ClickedCh:
+				if e.Path != "" {
+					opener.Reveal(e.Path)
 				}
-			case <-del.ClickedCh:
-				if err := u.a.Delete(id); err != nil {
-					u.a.Log.Printf("delete: %v", err)
+			case <-safe.ClickedCh:
+				if err := u.a.MarkSafe(e.SHA256); err != nil {
+					u.a.Log.Printf("mark safe: %v", err)
 				}
 			}
 		}
@@ -267,22 +305,13 @@ func (u *ui) addItem(e *quarantine.Entry) *itemUI {
 	return it
 }
 
-// setIcon reflects the worst verdict still in quarantine.
-func (u *ui) setIcon(items []*quarantine.Entry) {
+// setIcon reflects the worst verdict among recent entries not marked safe.
+func (u *ui) setIcon(recent []*index.Entry) {
 	if u.a.Scanning() > 0 {
 		systray.SetIcon(icons.scanning)
 		return
 	}
-	worst := ""
-	for _, e := range items {
-		switch {
-		case e.Verdict == string(analyze.VerdictMalicious):
-			worst = e.Verdict
-		case e.Verdict == string(analyze.VerdictSuspicious) && worst == "":
-			worst = e.Verdict
-		}
-	}
-	switch worst {
+	switch worstVerdict(recent) {
 	case string(analyze.VerdictMalicious):
 		systray.SetIcon(icons.malicious)
 	case string(analyze.VerdictSuspicious):
@@ -294,4 +323,19 @@ func (u *ui) setIcon(items []*quarantine.Entry) {
 			systray.SetIcon(icons.idle)
 		}
 	}
+}
+
+// worstVerdict is Malicious, Suspicious or "" over the flagged entries.
+func worstVerdict(recent []*index.Entry) string {
+	worst := ""
+	for _, e := range recent {
+		switch {
+		case !flagged(e):
+		case e.Verdict == string(analyze.VerdictMalicious):
+			return e.Verdict
+		default:
+			worst = e.Verdict
+		}
+	}
+	return worst
 }

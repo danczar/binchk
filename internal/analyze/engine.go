@@ -101,7 +101,7 @@ func (e *Engine) AnalyzeWait(parent context.Context, path string, meta Meta) (*R
 	released := make(chan struct{})
 	start := time.Now()
 	r := &Report{
-		ID: meta.ID, FileName: meta.FileName, OriginalPath: meta.OriginalPath, StoredPath: path,
+		ID: meta.ID, FileName: meta.FileName, OriginalPath: meta.OriginalPath,
 		Provenance: meta.Provenance, DetectedAt: meta.DetectedAt,
 	}
 	if r.FileName == "" {

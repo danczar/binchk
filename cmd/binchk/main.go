@@ -1,9 +1,10 @@
-// Command binchk watches folders for new executables, quarantines them,
-// analyses them in seconds and reports through the system tray.
+// Command binchk watches folders for new executables, analyses them where
+// they are in seconds, and reports through the system tray, Finder tags and
+// the report index the Quick Look extension reads.
 //
 //	binchk                 run the tray app (default)
 //	binchk watch           run headless, logging to stdout
-//	binchk scan FILE...    analyse files in place (no quarantine), write reports
+//	binchk scan FILE...    analyse files, write reports and index them
 package main
 
 import (
@@ -21,6 +22,7 @@ import (
 	"github.com/danczar/binchk/internal/config"
 	"github.com/danczar/binchk/internal/container"
 	"github.com/danczar/binchk/internal/detect"
+	"github.com/danczar/binchk/internal/index"
 	"github.com/danczar/binchk/internal/opener"
 	"github.com/danczar/binchk/internal/provenance"
 	"github.com/danczar/binchk/internal/report"
@@ -35,9 +37,10 @@ func usage() {
 usage:
   binchk [-config FILE]                 run in the system tray
   binchk watch [-config FILE]           watch folders headless (logs to stdout)
-  binchk scan [-open] [-json] [-out DIR] FILE|APP|DIR...
-                                        analyse files in place (no quarantine) and
-                                        write reports; directories are searched
+  binchk scan [-open] [-json] [-no-index] [-out DIR] FILE|APP|DIR...
+                                        analyse files and write reports; directories
+                                        are searched. Results are added to the report
+                                        index and Finder tags unless -no-index
   binchk version
 
 config: %s
@@ -84,7 +87,7 @@ func mustApp(cfgPath string, logToFile bool) *app.App {
 	if err != nil {
 		fatal(err)
 	}
-	a, err := app.New(cfg, logToFile)
+	a, err := app.New(cfg, logToFile, version)
 	if err != nil {
 		fatal(err)
 	}
@@ -98,6 +101,7 @@ func scan(args []string) int {
 	open := fs.Bool("open", false, "open each HTML report")
 	asJSON := fs.Bool("json", false, "also write a .json report")
 	budget := fs.Duration("budget", 0, "override the analysis time budget")
+	noIndex := fs.Bool("no-index", false, "do not add results to the report index or set Finder tags")
 	fs.Parse(args)
 	if fs.NArg() == 0 {
 		usage()
@@ -110,13 +114,22 @@ func scan(args []string) int {
 	if *budget > 0 {
 		cfg.AnalysisBudget = config.Duration(*budget)
 	}
-	eng, err := app.NewEngine(cfg)
+	eng, allow, err := app.NewEngineAllow(cfg)
 	if err != nil {
 		fatal(err)
 	}
 	dir := *out
 	if dir == "" {
 		dir = filepath.Join(cfg.DataPath(), "reports")
+	}
+	if dir, err = filepath.Abs(dir); err != nil {
+		fatal(err)
+	}
+	rec := &app.Recorder{Config: cfg, Allow: allow, Version: version, NoTags: *noIndex}
+	if !*noIndex {
+		if rec.Index, err = index.Open(cfg.DataPath()); err != nil {
+			fatal(err)
+		}
 	}
 	// Expand directories to the executables inside them.
 	var files []string
@@ -145,6 +158,10 @@ func scan(args []string) int {
 	worst := 0
 	for _, path := range files {
 		abs, _ := filepath.Abs(path)
+		idSt, idErr := app.IdentityStat(abs)
+		if idErr != nil {
+			idSt = nil
+		}
 		t0 := time.Now()
 		r := container.Analyze(context.Background(), eng, abs, analyze.Meta{
 			ID:         fmt.Sprintf("scan-%s-%s", time.Now().Format("20060102-150405"), sanitize(filepath.Base(abs))),
@@ -156,6 +173,9 @@ func scan(args []string) int {
 		}
 		if *asJSON {
 			_ = report.WriteJSON(r, strings.TrimSuffix(html, ".html")+".json")
+		}
+		if _, err := rec.Record(r, abs, html, idSt); err != nil {
+			fmt.Fprintln(os.Stderr, "index:", err)
 		}
 		fmt.Printf("%-11s %3d  %-8s %8.1f ms  %s\n", r.Verdict, r.Score, r.Format, float64(r.Elapsed.Microseconds())/1000, path)
 		fmt.Printf("            %s\n            report: %s\n", r.Summary, html)

@@ -110,7 +110,7 @@ func analyzeContainer(parent context.Context, eng *analyze.Engine, path string, 
 	ctx, cancel := context.WithTimeout(parent, eng.Budget())
 	defer cancel()
 	r := &analyze.Report{
-		ID: meta.ID, FileName: meta.FileName, OriginalPath: meta.OriginalPath, StoredPath: path,
+		ID: meta.ID, FileName: meta.FileName, OriginalPath: meta.OriginalPath,
 		Provenance: meta.Provenance, DetectedAt: meta.DetectedAt, Format: string(f), Size: fileSize(path),
 	}
 	if r.FileName == "" {
@@ -492,6 +492,12 @@ func contains(ss []string, s string) bool {
 func mainExecutable(ctx context.Context, app string) string {
 	info, _ := readPlist(ctx, filepath.Join(app, "Contents", "Info.plist"))
 	return filepath.Join(app, "Contents", "MacOS", info["CFBundleExecutable"])
+}
+
+// MainExecutable returns the path of an app bundle's CFBundleExecutable:
+// the file whose hash identifies the bundle.
+func MainExecutable(app string) string {
+	return mainExecutable(context.Background(), app)
 }
 
 func fileSize(p string) int64 {

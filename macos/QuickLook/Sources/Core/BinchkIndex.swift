@@ -1,40 +1,60 @@
 // Index lookup for the binchk Quick Look preview.
 //
-// binchk writes a content-addressed index next to its reports:
+// binchk writes a report index next to its reports (schema version 2):
 //
-//   <data>/index/<sha256>.html        ready-to-display card
-//   <data>/index/<sha256>.json        condensed result
-//   <data>/index/paths/<p>.json       {"sha256", "size", "mtime_unix_ns"}
+//   <data>/index/entries/<id>.html   ready-to-display card
+//   <data>/index/entries/<id>.json   condensed result
+//   <data>/index/paths/<p>.json      the entry last recorded for a path, with
+//                                    the item's state at the time
+//   <data>/index/content/<k>.json    the latest analysis of content k
 //
-// where <sha256> is the SHA-256 of the analysed file (for an .app bundle, of
-// its main executable) and <p> is the SHA-256 of the UTF-8 absolute path that
-// was analysed. This file is pure Foundation + CryptoKit so the command-line
-// harness in ../../Tests can exercise it outside the sandbox.
+// <p> is the SHA-256 of the UTF-8 absolute path. <k> is the item's content
+// key: a file's SHA-256, or an app bundle's fingerprint (see
+// bundleFingerprint; binchk's internal/bundleid computes the same value).
+// <id> names one analysis of one item at one path.
+//
+// A fresh path pointer leads straight to the item's own card. Otherwise the
+// content key is computed and the content map gives the most recent
+// analysis of the same content, which is shown with a "Matched by contents"
+// banner, since it may have been analysed elsewhere under another name.
+//
+// This file is pure Foundation + CryptoKit so the command-line harness in
+// ../../Tests can exercise it outside the sandbox.
 
 import CryptoKit
 import Darwin
 import Foundation
 
-/// Why there is no card to show for a file.
+/// Why there is no card to show for an item.
 enum NotCheckedReason: Error, Equatable, Sendable {
-    /// binchk has not recorded a result for these bytes.
+    /// binchk has not recorded a result for this content.
     case noEntry
-    /// The file is too big to hash quickly and no path pointer matched.
+    /// The item is too big to look up quickly and no path pointer matched.
     case tooLarge
-    /// The file (or the bundle's main executable) could not be read.
+    /// The item (or a bundle's main executable) could not be read, or the
+    /// bundle has no valid main executable.
     case unreadable
     /// An index entry exists but is not a plain, reasonably sized file.
     case invalidEntry
 }
 
-/// How the index key was found.
+/// What kind of item is previewed. An entry of another kind is never shown.
+enum ItemKind: String, Equatable, Sendable {
+    case file
+    case bundle
+}
+
+/// How the entry was found.
 enum KeySource: Equatable, Sendable {
+    /// Through the item's own path pointer.
     case pointer
-    case hash
+    /// Through its content key: the most recent analysis of the same
+    /// content, at `path` on `analyzedAt` (RFC 3339).
+    case content(path: String, analyzedAt: String)
 }
 
 enum PreviewOutcome: Equatable, Sendable {
-    case indexed(sha256: String, via: KeySource)
+    case indexed(entry: String, via: KeySource)
     case notChecked(NotCheckedReason)
 }
 
@@ -45,17 +65,26 @@ struct PreviewResult: Sendable {
 }
 
 struct BinchkIndex: Sendable {
+    static let schemaVersion = 2
     /// Largest card the preview will load.
     static let defaultMaxEntryBytes = 512 * 1024
-    /// Pointers are a few dozen bytes; anything bigger is not one.
-    static let maxPointerBytes = 4 * 1024
+    /// Largest entry JSON, pointer or content map the preview will read.
+    static let maxJSONBytes = 256 * 1024
+    /// Largest Info.plist read for a bundle (binchk uses the same limit).
+    static let maxInfoPlistBytes = 1 << 20
     /// Files above this size are only looked up through a pointer: hashing
     /// them would keep the preview spinning for seconds.
     static let defaultMaxHashBytes: Int64 = 1 << 30
+    /// Bundles with more entries than this, or whose walk takes longer than
+    /// the budget, are not looked up.
+    static let defaultMaxWalkEntries = 200_000
+    static let defaultWalkBudget: TimeInterval = 3
 
     let indexDir: String
     var maxEntryBytes = BinchkIndex.defaultMaxEntryBytes
     var maxHashBytes = BinchkIndex.defaultMaxHashBytes
+    var maxWalkEntries = BinchkIndex.defaultMaxWalkEntries
+    var walkBudget = BinchkIndex.defaultWalkBudget
 
     init(indexDir: String) {
         self.indexDir = indexDir
@@ -74,15 +103,19 @@ struct BinchkIndex: Sendable {
     }
 
     /// Resolves path to its index entry and returns the HTML to display:
-    /// the stored card, or a built-in "Not checked by binchk" card.
+    /// the stored card (with a banner when matched by contents), or a
+    /// built-in "Not checked by binchk" card.
     func preview(forPath rawPath: String) -> PreviewResult {
         let path = Self.normalize(rawPath)
         let name = (path as NSString).lastPathComponent
         let outcome = resolve(path)
         switch outcome {
-        case .indexed(let sha, _):
-            switch loadEntry(sha256: sha) {
-            case .success(let data):
+        case .indexed(let id, let via):
+            switch loadCard(entry: id) {
+            case .success(var data):
+                if case .content(let p, let at) = via {
+                    data = Self.injectBanner(data, banner: Self.banner(analysedPath: p, analyzedAt: at))
+                }
                 return PreviewResult(outcome: outcome, html: data)
             case .failure(let reason):
                 return PreviewResult(outcome: .notChecked(reason), html: Self.notCheckedCard(fileName: name, reason: reason))
@@ -92,12 +125,63 @@ struct BinchkIndex: Sendable {
         }
     }
 
-    // MARK: - Key resolution
+    // MARK: - Items
 
-    /// Finds the index key for path: through a fresh path pointer if there
-    /// is one, otherwise by hashing. The returned entry may still be absent.
+    /// The previewed item as binchk identifies it.
+    struct Item {
+        let kind: ItemKind
+        let path: String
+        /// File: the file's state. Bundle: its main executable's.
+        let stat: FileStat
+        /// Bundle only: the main executable and the resolved bundle root.
+        let executable: String?
+        let root: String?
+    }
+
+    /// Classifies path: a regular file (symlinks followed, as binchk's
+    /// os.Stat does), or an .app directory with a valid main executable.
+    static func item(at path: String) -> Item? {
+        var st = stat()
+        guard stat(path, &st) == 0 else { return nil }
+        switch st.st_mode & S_IFMT {
+        case S_IFREG:
+            guard let fs = statRegular(path) else { return nil }
+            return Item(kind: .file, path: path, stat: fs, executable: nil, root: nil)
+        case S_IFDIR:
+            guard let exe = mainExecutable(forBundle: path), let fs = statRegular(exe),
+                  let real = realpath(path, nil) else { return nil }
+            defer { free(real) }
+            return Item(kind: .bundle, path: path, stat: fs, executable: exe, root: String(cString: real))
+        default:
+            return nil
+        }
+    }
+
+    /// The main executable of an application bundle, Contents/MacOS/ +
+    /// CFBundleExecutable, or nil when the bundle has none: not an .app, no
+    /// regular Info.plist, or a CFBundleExecutable that is empty, ".", ".."
+    /// or contains "/" (binchk refuses the same names).
+    static func mainExecutable(forBundle path: String) -> String? {
+        guard (path as NSString).pathExtension.lowercased() == "app" else { return nil }
+        guard let data = readRegular(path + "/Contents/Info.plist", max: maxInfoPlistBytes),
+              let obj = try? PropertyListSerialization.propertyList(from: data, format: nil),
+              let dict = obj as? [String: Any],
+              let exe = dict["CFBundleExecutable"] as? String,
+              validExecutableName(exe)
+        else { return nil }
+        return path + "/Contents/MacOS/" + exe
+    }
+
+    static func validExecutableName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." && !name.contains("/") && !name.contains("\0")
+    }
+
+    // MARK: - Resolution
+
+    /// Finds the entry for path: through a fresh path pointer if there is
+    /// one, otherwise through its content key. The card may still be absent.
     func resolve(_ path: String) -> PreviewOutcome {
-        guard let target = Self.hashTarget(for: path), let st = Self.statRegular(target) else {
+        guard let item = Self.item(at: path) else {
             return .notChecked(.unreadable)
         }
         var candidates = [path]
@@ -106,46 +190,55 @@ struct BinchkIndex: Sendable {
             free(real)
             if r != path { candidates.append(r) }
         }
+        // A bundle's walk serves both the pointer check and the fingerprint.
+        var walked: Walk??
+        func walk() -> Walk? {
+            if case .some(let w) = walked { return w }
+            let w = Self.walk(root: item.root!, maxEntries: maxWalkEntries, budget: walkBudget)
+            walked = .some(w)
+            return w
+        }
         for p in candidates {
-            if let sha = pointer(forPath: p, size: st.size, mtimeNs: st.mtimeNs), entryExists(sha256: sha) {
-                return .indexed(sha256: sha, via: .pointer)
+            guard let ptr = pointer(forPath: p), ptr.kind == item.kind.rawValue else { continue }
+            let fresh: Bool
+            switch item.kind {
+            case .file:
+                fresh = ptr.size == item.stat.size && ptr.mtime_unix_ns == item.stat.mtimeNs
+            case .bundle:
+                fresh = ptr.exec_size == item.stat.size && ptr.exec_mtime_unix_ns == item.stat.mtimeNs
+                    && walk().map { ptr.tree_entries == $0.tree.entries && ptr.tree_size == $0.tree.size
+                        && ptr.tree_mtime_unix_ns == $0.tree.mtimeNs } == true
+            }
+            if fresh, let head = entryHead(ptr.entry), head.kind == item.kind.rawValue, cardExists(ptr.entry) {
+                return .indexed(entry: ptr.entry, via: .pointer)
             }
         }
-        // Without an index nothing can match, so don't read the whole file.
+        // Without an index nothing can match, so don't read the item.
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: indexDir, isDirectory: &isDir), isDir.boolValue else {
             return .notChecked(.noEntry)
         }
-        if st.size > maxHashBytes {
+        if item.stat.size > maxHashBytes {
             return .notChecked(.tooLarge)
         }
-        guard let sha = Self.sha256File(target) else {
-            return .notChecked(.unreadable)
+        let key: String
+        switch item.kind {
+        case .file:
+            guard let k = Self.sha256File(item.path) else { return .notChecked(.unreadable) }
+            key = k
+        case .bundle:
+            guard let w = walk() else { return .notChecked(.tooLarge) }
+            guard let main = Self.sha256File(item.executable!),
+                  let k = Self.bundleFingerprint(root: item.root!, mainSHA256: main, manifest: w.manifest)
+            else { return .notChecked(.unreadable) }
+            key = k
         }
-        guard entryExists(sha256: sha) else {
-            return .notChecked(.noEntry)
-        }
-        return .indexed(sha256: sha, via: .hash)
-    }
-
-    /// The file whose bytes key the index: path itself, or the main
-    /// executable of an application bundle (Contents/MacOS/CFBundleExecutable,
-    /// exactly as binchk computes it).
-    static func hashTarget(for path: String) -> String? {
-        var st = stat()
-        guard stat(path, &st) == 0 else { return nil }
-        if st.st_mode & S_IFMT != S_IFDIR {
-            return path
-        }
-        guard (path as NSString).pathExtension.lowercased() == "app" else { return nil }
-        let plist = path + "/Contents/Info.plist"
-        guard let data = readRegular(plist, max: 1 << 20),
-              let obj = try? PropertyListSerialization.propertyList(from: data, format: nil),
-              let dict = obj as? [String: Any],
-              let exe = dict["CFBundleExecutable"] as? String,
-              !exe.isEmpty, exe != ".", exe != "..", !exe.contains("/"), !exe.contains("\0")
-        else { return nil }
-        return path + "/Contents/MacOS/" + exe
+        guard let ref = contentRef(key),
+              let head = entryHead(ref.entry),
+              head.kind == item.kind.rawValue, head.content_key == key,
+              cardExists(ref.entry)
+        else { return .notChecked(.noEntry) }
+        return .indexed(entry: ref.entry, via: .content(path: ref.path, analyzedAt: ref.analyzed_at))
     }
 
     /// Absolute, with "." and ".." removed and no trailing slash, the way
@@ -156,43 +249,230 @@ struct BinchkIndex: Sendable {
         return p
     }
 
-    private struct Pointer: Decodable {
-        let sha256: String
-        let size: Int64
-        let mtime_unix_ns: Int64
+    struct Pointer: Decodable {
+        let version: Int
+        let entry: String
+        let kind: String
+        let size: Int64?
+        let mtime_unix_ns: Int64?
+        let tree_entries: Int64?
+        let tree_size: Int64?
+        let tree_mtime_unix_ns: Int64?
+        let exec_size: Int64?
+        let exec_mtime_unix_ns: Int64?
     }
 
-    /// The digest a path pointer records for path, if the pointer exists, is
-    /// well formed and still matches the file's size and mtime.
-    func pointer(forPath path: String, size: Int64, mtimeNs: Int64) -> String? {
+    private struct EntryHead: Decodable {
+        let version: Int
+        let entry_id: String
+        let content_key: String
+        let kind: String
+    }
+
+    private struct ContentRef: Decodable {
+        let version: Int
+        let entry: String
+        let path: String
+        let analyzed_at: String
+    }
+
+    private func readJSON<T: Decodable>(_ type: T.Type, _ path: String) -> T? {
+        guard let data = Self.readRegular(path, max: Self.maxJSONBytes) else { return nil }
+        return try? JSONDecoder().decode(type, from: data)
+    }
+
+    /// The pointer for path, if it exists and is well formed. Whether it is
+    /// still fresh is up to the caller.
+    func pointer(forPath path: String) -> Pointer? {
         let key = Self.hex(SHA256.hash(data: Data(path.utf8)))
-        guard let data = Self.readRegular(indexDir + "/paths/" + key + ".json", max: Self.maxPointerBytes),
-              let p = try? JSONDecoder().decode(Pointer.self, from: data),
-              Self.isDigest(p.sha256), p.size == size, p.mtime_unix_ns == mtimeNs
+        guard let p = readJSON(Pointer.self, indexDir + "/paths/" + key + ".json"),
+              p.version == Self.schemaVersion, Self.isDigest(p.entry)
         else { return nil }
-        return p.sha256
+        return p
     }
 
-    // MARK: - Entries
-
-    private func entryPath(_ sha256: String) -> String {
-        indexDir + "/" + sha256 + ".html"
+    private func contentRef(_ key: String) -> ContentRef? {
+        guard Self.isDigest(key),
+              let c = readJSON(ContentRef.self, indexDir + "/content/" + key + ".json"),
+              c.version == Self.schemaVersion, Self.isDigest(c.entry)
+        else { return nil }
+        return c
     }
 
-    private func entryExists(sha256: String) -> Bool {
+    private func entryHead(_ id: String) -> EntryHead? {
+        guard Self.isDigest(id),
+              let e = readJSON(EntryHead.self, indexDir + "/entries/" + id + ".json"),
+              e.version == Self.schemaVersion, e.entry_id == id
+        else { return nil }
+        return e
+    }
+
+    // MARK: - Cards
+
+    private func cardPath(_ id: String) -> String {
+        indexDir + "/entries/" + id + ".html"
+    }
+
+    private func cardExists(_ id: String) -> Bool {
         var st = stat()
-        return Self.isDigest(sha256) && lstat(entryPath(sha256), &st) == 0
+        return Self.isDigest(id) && lstat(cardPath(id), &st) == 0
     }
 
-    func loadEntry(sha256: String) -> Result<Data, NotCheckedReason> {
-        guard Self.isDigest(sha256) else { return .failure(.invalidEntry) }
-        let p = entryPath(sha256)
+    func loadCard(entry id: String) -> Result<Data, NotCheckedReason> {
+        guard Self.isDigest(id) else { return .failure(.invalidEntry) }
+        let p = cardPath(id)
         var st = stat()
         guard lstat(p, &st) == 0 else { return .failure(.noEntry) }
         guard let data = Self.readRegular(p, max: maxEntryBytes), !data.isEmpty else {
             return .failure(.invalidEntry)
         }
         return .success(data)
+    }
+
+    /// The banner shown above a card found by content: where and when that
+    /// content was analysed. Everything in it is escaped.
+    static func banner(analysedPath: String, analyzedAt: String) -> String {
+        let name = (analysedPath as NSString).lastPathComponent
+        let folder = (analysedPath as NSString).deletingLastPathComponent
+        var when = analyzedAt
+        if let date = ISO8601DateFormatter().date(from: analyzedAt) {
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.dateFormat = "d MMM yyyy, HH:mm"
+            when = f.string(from: date)
+        }
+        return "<div class=\"match\">Matched by contents — analysed as <b>\(escape(name))</b> in \(escape(folder)) on \(escape(when)).</div>"
+    }
+
+    /// Puts banner at the top of the card.
+    static func injectBanner(_ card: Data, banner: String) -> Data {
+        var html = String(decoding: card, as: UTF8.self)
+        if let r = html.range(of: "<div class=\"card\">") {
+            html.insert(contentsOf: banner, at: r.upperBound)
+        } else if let r = html.range(of: "<body"), let close = html[r.upperBound...].firstIndex(of: ">") {
+            html.insert(contentsOf: banner, at: html.index(after: close))
+        } else {
+            html = banner + html
+        }
+        return Data(html.utf8)
+    }
+
+    // MARK: - Bundle fingerprint
+
+    struct Tree: Equatable {
+        var entries: Int64 = 0
+        var size: Int64 = 0
+        var mtimeNs: Int64 = 0
+    }
+
+    struct ManifestEntry {
+        let path: [UInt8]
+        let type: UInt8
+        let value: [UInt8]
+    }
+
+    struct Walk {
+        let tree: Tree
+        let manifest: [ManifestEntry]
+    }
+
+    /// Walks root without following symbolic links: the tree summary (root
+    /// included) and the sorted manifest (root excluded). nil when an entry
+    /// cannot be read, or the walk exceeds maxEntries or budget seconds.
+    static func walk(root: String, maxEntries: Int, budget: TimeInterval) -> Walk? {
+        let rootBytes = Array(root.utf8)
+        let deadline = Date().addingTimeInterval(budget)
+        var tree = Tree()
+        var manifest: [ManifestEntry] = []
+        func account(_ st: stat) -> Bool {
+            tree.entries += 1
+            tree.size += Int64(st.st_size)
+            let ns = Int64(st.st_mtimespec.tv_sec).multipliedReportingOverflow(by: 1_000_000_000)
+            guard !ns.overflow else { return false }
+            tree.mtimeNs = max(tree.mtimeNs, ns.partialValue + Int64(st.st_mtimespec.tv_nsec))
+            return true
+        }
+        var st = stat()
+        guard withCPath(rootBytes, { lstat($0, &st) }) == 0, st.st_mode & S_IFMT == S_IFDIR, account(st) else { return nil }
+        var dirs: [[UInt8]] = [[]]
+        while let rel = dirs.popLast() {
+            let dirPath = rel.isEmpty ? rootBytes : rootBytes + [0x2f] + rel
+            guard let d = withCPath(dirPath, { opendir($0) }) else { return nil }
+            defer { closedir(d) }
+            while let ent = readdir(d) {
+                let name = withUnsafeBytes(of: ent.pointee.d_name) { Array($0.prefix(Int(ent.pointee.d_namlen))) }
+                if name == [0x2e] || name == [0x2e, 0x2e] { continue }
+                let childRel = rel.isEmpty ? name : rel + [0x2f] + name
+                let childPath = rootBytes + [0x2f] + childRel
+                guard withCPath(childPath, { lstat($0, &st) }) == 0, account(st) else { return nil }
+                if tree.entries > Int64(maxEntries) { return nil }
+                if tree.entries % 1024 == 0 && Date() > deadline { return nil }
+                switch st.st_mode & S_IFMT {
+                case S_IFDIR:
+                    dirs.append(childRel)
+                    manifest.append(ManifestEntry(path: childRel, type: UInt8(ascii: "d"), value: []))
+                case S_IFLNK:
+                    guard let target = readLink(childPath) else { return nil }
+                    manifest.append(ManifestEntry(path: childRel, type: UInt8(ascii: "l"), value: target))
+                case S_IFREG:
+                    manifest.append(ManifestEntry(path: childRel, type: UInt8(ascii: "f"), value: Array(String(st.st_size).utf8)))
+                default:
+                    manifest.append(ManifestEntry(path: childRel, type: UInt8(ascii: "o"), value: []))
+                }
+            }
+        }
+        manifest.sort { $0.path.lexicographicallyPrecedes($1.path) }
+        return Walk(tree: tree, manifest: manifest)
+    }
+
+    /// The bundle fingerprint (binchk's internal/bundleid):
+    ///
+    ///   SHA-256( str(domain) str(main) str(seal) u64(n) { str(path) str(type) str(value) } )
+    ///
+    /// with str(s) = u64(len(s)) ‖ s and u64 big-endian. main is the main
+    /// executable's SHA-256 (hex), seal the SHA-256 of a regular
+    /// Contents/_CodeSignature/CodeResources (or "none").
+    static func bundleFingerprint(root: String, mainSHA256: String, manifest: [ManifestEntry]) -> String? {
+        let sealPath = root + "/Contents/_CodeSignature/CodeResources"
+        var seal = "none"
+        var st = stat()
+        if lstat(sealPath, &st) == 0 && st.st_mode & S_IFMT == S_IFREG {
+            guard let h = sha256File(sealPath, followLinks: false) else { return nil }
+            seal = h
+        }
+        var hasher = SHA256()
+        func u64(_ v: Int) {
+            var be = UInt64(v).bigEndian
+            withUnsafeBytes(of: &be) { hasher.update(bufferPointer: $0) }
+        }
+        func str(_ b: [UInt8]) {
+            u64(b.count)
+            hasher.update(data: b)
+        }
+        str(Array("binchk bundle fingerprint v2".utf8))
+        str(Array(mainSHA256.utf8))
+        str(Array(seal.utf8))
+        u64(manifest.count)
+        for e in manifest {
+            str(e.path)
+            str([e.type])
+            str(e.value)
+        }
+        return hex(hasher.finalize())
+    }
+
+    private static func withCPath<R>(_ bytes: [UInt8], _ body: (UnsafePointer<CChar>) -> R) -> R {
+        let c = bytes.map { CChar(bitPattern: $0) } + [0]
+        return c.withUnsafeBufferPointer { body($0.baseAddress!) }
+    }
+
+    private static func readLink(_ path: [UInt8]) -> [UInt8]? {
+        var buf = [UInt8](repeating: 0, count: Int(PATH_MAX) + 1)
+        let n = withCPath(path) { p in
+            buf.withUnsafeMutableBufferPointer { readlink(p, UnsafeMutableRawPointer($0.baseAddress!).assumingMemoryBound(to: CChar.self), $0.count) }
+        }
+        guard n >= 0 else { return nil }
+        return Array(buf[0..<n])
     }
 
     // MARK: - File helpers
@@ -255,9 +535,10 @@ struct BinchkIndex: Sendable {
         return data
     }
 
-    /// Streaming SHA-256 of a regular file, lowercase hex.
-    static func sha256File(_ path: String) -> String? {
-        let fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+    /// Streaming SHA-256 of a regular file, lowercase hex. followLinks:
+    /// false refuses a symlink as the final component.
+    static func sha256File(_ path: String, followLinks: Bool = true) -> String? {
+        let fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | (followLinks ? 0 : O_NOFOLLOW))
         guard fd >= 0 else { return nil }
         defer { close(fd) }
         var st = stat()
@@ -296,7 +577,7 @@ struct BinchkIndex: Sendable {
         return out
     }
 
-    /// The card shown when binchk has no result for a file. Same palette as
+    /// The card shown when binchk has no result for an item. Same palette as
     /// binchk's reports; inline CSS only.
     static func notCheckedCard(fileName: String, reason: NotCheckedReason) -> Data {
         let detail: String
@@ -304,11 +585,11 @@ struct BinchkIndex: Sendable {
         case .noEntry:
             detail = "binchk checks new downloads automatically; run <code>binchk scan &lt;file&gt;</code> to check this one."
         case .tooLarge:
-            detail = "This file is too large to look up quickly. Run <code>binchk scan &lt;file&gt;</code> to check it."
+            detail = "This item is too large to look up quickly. Run <code>binchk scan &lt;file&gt;</code> to check it."
         case .unreadable:
             detail = "The preview could not read this item. Run <code>binchk scan &lt;file&gt;</code> to check it."
         case .invalidEntry:
-            detail = "binchk&#39;s stored result for this file could not be loaded. Run <code>binchk scan &lt;file&gt;</code> to check it again."
+            detail = "binchk&#39;s stored result for this item could not be loaded. Run <code>binchk scan &lt;file&gt;</code> to check it again."
         }
         let html = """
         <!doctype html>

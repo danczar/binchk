@@ -230,7 +230,7 @@ func (u *ui) refresh() {
 	}
 	keys := make([]string, 0, len(recent))
 	for _, e := range recent {
-		keys = append(keys, fmt.Sprintf("%s|%s|%s|%s|%v", e.SHA256, e.Path, e.Verdict, e.AnalyzedAt, e.MarkedSafe))
+		keys = append(keys, fmt.Sprintf("%s|%s|%s|%s|%v", e.EntryID, e.Path, e.Verdict, e.AnalyzedAt, e.MarkedSafe))
 	}
 	if slices.Equal(keys, u.shownKeys) && u.shownKeys != nil {
 		return
@@ -277,8 +277,8 @@ func (u *ui) addItem(e *index.Entry) *itemUI {
 	info.Disable()
 	open := root.AddSubMenuItem("Open report", "")
 	reveal := root.AddSubMenuItem(revealLabel(), "")
-	safe := root.AddSubMenuItem("Mark as safe", "Trust this file's content: allowlists its hash and removes binchk's tag")
-	if e.MarkedSafe || !index.IsDigest(e.SHA256) {
+	safe := root.AddSubMenuItem("Mark as safe", "Trust this item's content: allowlists it and removes binchk's tag from its copies")
+	if e.MarkedSafe || !index.IsDigest(e.EntryID) {
 		safe.Disable()
 	}
 	it := &itemUI{root: root, done: make(chan struct{})}
@@ -296,7 +296,7 @@ func (u *ui) addItem(e *index.Entry) *itemUI {
 					opener.Reveal(e.Path)
 				}
 			case <-safe.ClickedCh:
-				if err := u.a.MarkSafe(e.SHA256); err != nil {
+				if err := u.a.MarkSafe(e.EntryID); err != nil {
 					u.a.Log.Printf("mark safe: %v", err)
 				}
 			}

@@ -682,9 +682,13 @@ func applyScore(r *Report, total int, allow *HashList) {
 	if trustedSigner && r.Verdict == VerdictMalicious && maxSev < Critical {
 		r.Verdict = VerdictSuspicious
 	}
-	if note, ok := allow.Lookup(r.Hashes.SHA256); ok {
+	if note, ok := allow.Lookup(r.ContentKey()); ok {
+		title := "SHA-256 is on your allowlist"
+		if r.IsBundle() {
+			title = "This app bundle is on your allowlist"
+		}
 		r.Verdict, r.Score = VerdictClean, 0
-		r.Findings = append([]Finding{{ID: "hash-allowlist", Title: "SHA-256 is on your allowlist", Severity: Info, Category: "reputation", Evidence: []string{note}}}, r.Findings...)
+		r.Findings = append([]Finding{{ID: "hash-allowlist", Title: title, Severity: Info, Category: "reputation", Evidence: []string{note}}}, r.Findings...)
 	}
 
 	var parts []string

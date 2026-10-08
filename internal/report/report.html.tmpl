@@ -143,7 +143,8 @@ footer{margin-top:40px;color:var(--muted);font-size:12px;text-align:center}
 <h2>Identity</h2>
 <section class="panel">
 <table>
-  <tr><td class="k">SHA-256</td><td class="mono hash" title="Click to copy">{{.Hashes.SHA256}}</td></tr>
+  {{if .Hashes.Bundle}}<tr><td class="k">Bundle fingerprint</td><td class="mono hash" title="Click to copy">{{.Hashes.Bundle}}</td></tr>{{end}}
+  <tr><td class="k">{{if .Hashes.Bundle}}Main executable SHA-256{{else}}SHA-256{{end}}</td><td class="mono hash" title="Click to copy">{{.Hashes.SHA256}}</td></tr>
   <tr><td class="k">SHA-1</td><td class="mono hash" title="Click to copy">{{.Hashes.SHA1}}</td></tr>
   <tr><td class="k">MD5</td><td class="mono hash" title="Click to copy">{{.Hashes.MD5}}</td></tr>
   {{if .Hashes.Imphash}}<tr><td class="k">Imphash</td><td class="mono hash" title="Click to copy">{{.Hashes.Imphash}}</td></tr>{{end}}

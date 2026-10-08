@@ -16,6 +16,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
+	"github.com/danczar/binchk/internal/bundleid"
 	"github.com/danczar/binchk/internal/config"
 	"github.com/danczar/binchk/internal/detect"
 )
@@ -38,22 +39,11 @@ type pending struct {
 }
 
 // treeState summarises a directory tree so a bundle can be considered
-// complete once it stops changing.
+// complete once it stops changing. It is the same summary the report index
+// records for a bundle's path pointer.
 func treeState(root string) (count int, size int64, mtime time.Time) {
-	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || count > 500000 {
-			return nil
-		}
-		count++
-		if info, err := d.Info(); err == nil {
-			size += info.Size()
-			if info.ModTime().After(mtime) {
-				mtime = info.ModTime()
-			}
-		}
-		return nil
-	})
-	return
+	t := bundleid.Summarize(root)
+	return int(t.Entries), t.Size, time.Unix(0, t.MtimeUnixNs)
 }
 
 // touchBundle starts (or extends) the settle period for an app bundle.

@@ -158,7 +158,7 @@ func scan(args []string) int {
 	worst := 0
 	for _, path := range files {
 		abs, _ := filepath.Abs(path)
-		idSt, idErr := app.IdentityStat(abs)
+		idSt, idErr := app.IdentityState(abs)
 		if idErr != nil {
 			idSt = nil
 		}

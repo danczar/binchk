@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -74,7 +75,7 @@ func (in *inspector) inspectApp(abs, rel string, assess, partial bool) {
 		in.setProp(idx, "Dock icon", "none (runs in the background / menu bar)")
 	}
 	exe := info["CFBundleExecutable"]
-	mainPath := filepath.Join(abs, "Contents", "MacOS", exe)
+	mainPath, exeOK := bundleExecutable(abs, info)
 
 	// Apple's verdicts start first: on big apps they are the slowest part.
 	var (
@@ -174,7 +175,11 @@ func (in *inspector) inspectApp(abs, rel string, assess, partial bool) {
 
 	// Structure checks and the file walk.
 	if !partial {
-		if exe == "" || fileSize(mainPath) == 0 {
+		if !exeOK && exe != "" {
+			in.add(analyze.Finding{ID: "app-no-executable", Title: "App has no valid main executable",
+				Detail:   "Its CFBundleExecutable does not name a file inside Contents/MacOS, so binchk does not take it as the app's identity.",
+				Severity: analyze.Medium, Category: "structure", Evidence: []string{rel + ": CFBundleExecutable " + strconv.Quote(exe)}})
+		} else if !exeOK || fileSize(mainPath) == 0 {
 			in.add(analyze.Finding{ID: "app-no-executable", Title: "App has no valid main executable",
 				Severity: analyze.Medium, Category: "structure", Evidence: []string{rel}})
 		} else if hasShebang(mainPath) {

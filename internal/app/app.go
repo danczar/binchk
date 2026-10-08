@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -306,9 +305,9 @@ func (a *App) Handle(path string, detectedAt time.Time) {
 	}
 	a.emit(Event{Kind: ScanStarted, Path: path})
 
-	// The identity file's state before analysis: if it changes meanwhile,
-	// the pointer will not match and a reader hashes instead.
-	idSt, idErr := IdentityStat(path)
+	// The item's state before analysis: if it changes meanwhile, the
+	// pointer will not match and a reader computes the content key instead.
+	idSt, idErr := IdentityState(path)
 	id := newID()
 	a.sem <- struct{}{}
 	r := container.AnalyzeWith(context.Background(), a.eng, path, analyze.Meta{
@@ -346,13 +345,14 @@ func (a *App) Handle(path string, detectedAt time.Time) {
 	}
 }
 
-// insertRecent puts e first, dropping an older entry for the same content
-// (or, for unhashed results, the same path).
+// insertRecent puts e first, dropping an older result for the same entry
+// (the same path and content; for results without a content key, the same
+// path).
 func insertRecent(list []*index.Entry, e *index.Entry) []*index.Entry {
 	out := make([]*index.Entry, 0, len(list)+1)
 	out = append(out, e)
 	for _, o := range list {
-		if (e.SHA256 != "" && o.SHA256 == e.SHA256) || (e.SHA256 == "" && o.SHA256 == "" && o.Path == e.Path) {
+		if (e.EntryID != "" && o.EntryID == e.EntryID) || (e.EntryID == "" && o.EntryID == "" && o.Path == e.Path) {
 			continue
 		}
 		out = append(out, o)
@@ -403,38 +403,64 @@ func NotificationBody(r *analyze.Report) string {
 	return what + ". Open binchk ▸ Recent reports."
 }
 
-// MarkSafe trusts a file's content: its hash joins the allowlist, binchk's
-// Finder tag comes off and its index entry says it was marked safe.
-func (a *App) MarkSafe(sha string) error {
-	if !index.IsDigest(sha) {
-		return errors.New("no content hash to mark as safe")
+// MarkSafe trusts the content of the entry with id: its content key (a
+// file's SHA-256, or an app bundle's fingerprint, never the bundle's main
+// executable alone) joins the allowlist. Every entry for that content is
+// marked safe and its card re-rendered, and binchk's Finder tag comes off
+// every path those entries were recorded at that still holds the content.
+func (a *App) MarkSafe(id string) error {
+	if !index.IsDigest(id) {
+		return errors.New("no index entry to mark as safe")
 	}
-	e, err := a.rec.Index.Get(sha)
+	e, err := a.rec.Index.Get(id)
 	if err != nil {
 		return err
 	}
-	if err := a.rec.Allow.Add(sha, "marked safe: "+e.FileName); err != nil {
+	key := e.ContentKey
+	if !index.IsDigest(key) {
+		return errors.New("no content key to mark as safe")
+	}
+	note := "marked safe: " + e.FileName
+	if e.Kind == index.KindBundle {
+		note += " (app bundle fingerprint)"
+	}
+	if err := a.rec.Allow.Add(key, note); err != nil {
 		return fmt.Errorf("allowlist: %w", err)
 	}
-	if e, err = a.rec.Index.SetMarkedSafe(sha, true); err != nil {
+	same, err := a.rec.Index.ByContent(key)
+	if err != nil {
 		return err
 	}
-	if err := a.rec.untag(e.Path); err != nil {
-		a.Log.Printf("finder tag %s: %v", e.Path, err)
+	var errs []error
+	for _, s := range same {
+		if s.Kind != e.Kind {
+			continue
+		}
+		if _, err := a.rec.Index.SetMarkedSafe(s.EntryID, true); err != nil {
+			errs = append(errs, err)
+		}
+		for _, p := range s.Paths {
+			if !a.rec.holds(p, s) {
+				continue
+			}
+			if err := a.rec.untag(p); err != nil {
+				a.Log.Printf("finder tag %s: %v", p, err)
+			}
+		}
 	}
-	a.Log.Printf("marked safe: %s (%s)", e.Path, sha)
+	a.Log.Printf("marked safe: %s (%s %s)", e.Path, e.Kind, key)
 	a.mu.Lock()
 	for _, r := range a.recent {
-		if r.SHA256 == sha {
+		if r.ContentKey == key {
 			r.MarkedSafe = true
 		}
 	}
-	if a.latest != nil && a.latest.SHA256 == sha {
+	if a.latest != nil && a.latest.ContentKey == key {
 		a.latest.MarkedSafe = true
 	}
 	a.mu.Unlock()
 	a.emit(Event{Kind: ItemsChanged})
-	return nil
+	return errors.Join(errs...)
 }
 
 // ClearRecent hides every current entry from the recent list. Reports and
@@ -475,13 +501,4 @@ func (a *App) saveState(s state) error {
 		return err
 	}
 	return os.Rename(tmp, a.statePath())
-}
-
-// IdentityStat returns the state of the file whose hash identifies path:
-// the file itself, or an app bundle's main executable.
-func IdentityStat(path string) (fs.FileInfo, error) {
-	if detect.IsAppBundle(path) {
-		return os.Stat(container.MainExecutable(path))
-	}
-	return os.Stat(path)
 }

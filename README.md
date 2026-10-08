@@ -50,7 +50,7 @@ flagged download is up to you.
 - 🕵️ **357 content signatures in 36 rules** (ASCII and UTF‑16) for ransomware, cryptominers, infostealers (browsers, wallets, keychain, fake password prompts), offensive tooling, persistence, Gatekeeper/Defender tampering, reverse shells, exfiltration channels and more. All of them are matched in a **single pass**.
 - 🌐 **Extracts indicators**: URLs, raw-IP URLs, public IPs, `.onion` addresses, and checksum-verified Bitcoin and Monero addresses.
 - 🧾 **Readable reports**: a self-contained HTML report (light and dark) plus JSON, a compact card for Quick Look, a native notification, and a tray tooltip.
-- 🧠 **Learns from you.** *Mark as safe* allowlists a file's hash and removes its tag. You can add your own rules and hash blocklists.
+- 🧠 **Learns from you.** *Mark as safe* allowlists a file's hash (or an app's bundle fingerprint) and removes its tag from every copy. You can add your own rules and hash blocklists.
 
 ## How it works
 
@@ -152,7 +152,9 @@ re-analysed as clean, or that you mark as safe, loses the tag.
 
 Select a file in Finder to see its binchk card in the preview pane or with
 Space: verdict, risk score, signer and notarization, and the top findings.
-Files binchk hasn't looked at show "Not checked by binchk".
+Files binchk hasn't looked at show "Not checked by binchk". A copy binchk hasn't
+seen whose content matches something it has analysed shows that card, with a
+note saying which file it was analysed as, where and when.
 
 The card comes from a Quick Look extension inside `binchk.app`:
 
@@ -250,26 +252,57 @@ the severity when more of them do. The built-in rules live in
 
 Hash lists are plain text files with one `sha256 [note]` per line. A
 blocklisted hash is critical; an allowlisted one (which *Mark as safe* adds) is
-always Clean.
+always Clean. For an `.app`, the blocklist matches its main executable's hash
+and the executables inside it, while the allowlist matches only the whole bundle's
+fingerprint (see below), so trusting one app never trusts another app that
+reuses its main executable.
 
 ### The report index
 
 Every analysis, from the watcher or `binchk scan`, is also recorded in a small
-content-addressed index in the data folder, which is what the Quick Look card
-reads:
+index in the data folder, which is what the Quick Look card reads (schema
+version 2):
 
 ```
-index/<sha256>.json       condensed result: verdict, score, signer, top findings, report path
-index/<sha256>.html       the compact, self-contained card (no scripts, no external resources)
-index/paths/<p>.json      p = SHA-256 of the file's absolute path → {sha256, size, mtime_unix_ns}
+index/entries/<id>.json   condensed result: verdict, score, signer, top findings, report path,
+                          entry_id, content_key, kind ("file" or "bundle"), paths
+index/entries/<id>.html   the compact, self-contained card (no scripts, no external resources)
+index/paths/<p>.json      p = SHA-256 of the item's absolute path → {entry, kind, staleness data}
+index/content/<k>.json    k = content key → {entry, path, analyzed_at} of its latest analysis
 ```
 
-`<sha256>` is the file's SHA-256 (for an `.app`, its main executable's). The
-path pointer lets a reader find a file's entry without hashing it, as long as
-the file's size and modification time still match; otherwise it hashes the
-file. Files are written atomically and named only by hex digests. Identical
-content downloaded twice shares one entry. Use `binchk scan -no-index` to keep
-a one-off scan out of the index.
+An item's **content key** is the file's SHA-256, or for an `.app` its *bundle
+fingerprint*: a SHA-256 over the main executable's hash, the hash of
+`Contents/_CodeSignature/CodeResources`, and a manifest of every entry in the
+bundle (path, type, size, symbolic-link target). Two apps that share a main
+executable but differ anywhere else have different fingerprints.
+
+Each **entry** is one analysis of one item at one path:
+`<id>` = SHA-256 of `"v2\0" + absolute path + "\0" + content key`. Analysing
+the same path with the same content again replaces the entry; anything else
+gets its own entry and card, so a copy of an app with extra files never shows
+the original's card, and the same bytes under two names (where name-based
+findings such as a double extension differ) keep separate cards.
+
+A reader first looks up the **path pointer**, which it uses only while the
+item is unchanged: the same size and modification time for a file; for an
+app, the same number of entries, total size and newest modification time in
+the bundle, and the same main executable size and modification time. Otherwise
+it computes the content key and uses the **content map**, which names the most
+recent analysis of the same content, possibly under another name or folder.
+Quick Look then shows that card with a banner saying where and when it was
+analysed. Apps too large to walk quickly (over 200,000 entries) and files over
+1 GiB without a matching pointer show "Not checked".
+
+Files are written atomically, named only by hex digests, and every JSON file
+carries `"version": 2`. Index files from earlier development builds are
+removed when binchk starts. Use `binchk scan -no-index` to keep a one-off scan
+out of the index.
+
+*Mark as safe* allowlists the item's content key (for an app, its bundle
+fingerprint, never its main executable alone), marks every entry with that
+content as safe, and removes binchk's tag from each path those entries were
+recorded at that still holds the same content.
 
 ## Under the hood
 
@@ -289,7 +322,8 @@ internal/container    .app / .dmg / .pkg inspection
 internal/xar          pure-Go xar, cpio and pbzx readers with safe extraction
 internal/watcher      fsnotify, settling, magic-byte and bundle detection
 internal/app          pipeline, recent reports, mark as safe, events
-internal/index        content-addressed report index read by the Quick Look card
+internal/index        report index read by the Quick Look card
+internal/bundleid     .app bundle fingerprint (mirrored in the Quick Look extension)
 internal/findertag    Finder tags via _kMDItemUserTags (macOS)
 internal/bplist       minimal binary property list reader and writer
 internal/legacy       one-time return of files held in the v0.1 vault
@@ -310,6 +344,7 @@ make bench    # matcher and engine benchmarks
 make rules    # re-embed internal/analyze/rules/builtin.json after editing it
 make icons    # re-render the icon and the Windows resources
 make quicklook-test  # macOS: index lookup tests for the Quick Look extension
+make quicklook-join  # macOS: binchk scan/watch write an index, the Swift reader resolves it
 ```
 
 The test suite builds inert "malware-looking" samples for all three OSes, plus

@@ -14,7 +14,7 @@ DARWIN_ENV := MACOSX_DEPLOYMENT_TARGET=$(MACOS_MIN) \
 
 REL := dist/release
 
-.PHONY: build all darwin linux windows quicklook quicklook-test app release icons test bench rules clean
+.PHONY: build all darwin linux windows quicklook quicklook-test quicklook-join app release icons test bench rules clean
 
 build:            ## native build for this machine
 	go build -trimpath -ldflags "$(LDFLAGS)" -o bin/binchk $(PKG)
@@ -55,6 +55,9 @@ quicklook-test:   ## macOS: index lookup tests for the preview extension
 	swiftc -swift-version 6 -target $$(uname -m)-apple-macos$(MACOS_MIN) \
 		-o dist/quicklook-test/run $(QL)/Sources/Core/BinchkIndex.swift $(QL)/Tests/main.swift
 	dist/quicklook-test/run "$${TMPDIR:-/tmp}"
+
+quicklook-join:   ## macOS: binchk scan/watch write an index, the compiled Swift reader resolves it
+	BINCHK_QL_JOIN=1 go test ./internal/app -run TestQuickLookJoin -count=1 -v
 
 app: darwin quicklook   ## macOS menu-bar .app bundle
 	MACOS_MIN=$(MACOS_MIN) APPEX=$(QL_APPEX) scripts/macos-bundle.sh dist/binchk-darwin $(VERSION)

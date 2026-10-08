@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/danczar/binchk/internal/analyze"
+	"github.com/danczar/binchk/internal/bundleid"
 	"github.com/danczar/binchk/internal/detect"
 )
 
@@ -126,11 +127,13 @@ func analyzeContainer(parent context.Context, eng *analyze.Engine, path string, 
 	}
 	in := newInspector(ctx, eng, r, string(kind))
 	in.poly = poly
-	// A bundle is a directory: its identity is its main executable's hash
-	// (what the allowlist and blocklist match on).
-	hashTarget := path
+	// A bundle is a directory: its hashes are its main executable's (what
+	// the blocklist matches on), and its identity is the bundle fingerprint
+	// computed below (what the allowlist and the index use). A bundle whose
+	// CFBundleExecutable is invalid has neither.
+	hashTarget, hashOK := path, true
 	if f == detect.AppBundle {
-		hashTarget = mainExecutable(ctx, path)
+		hashTarget, hashOK = mainExecutable(ctx, path)
 		in.goTask(func() {
 			var total int64
 			filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
@@ -146,14 +149,16 @@ func analyzeContainer(parent context.Context, eng *analyze.Engine, path string, 
 			in.mu.Unlock()
 		})
 	}
-	in.goTask(func() {
-		t0 := time.Now()
-		h, err := analyze.HashFile(ctx, hashTarget)
-		in.timed("hash", t0, err)
-		in.mu.Lock()
-		r.Hashes = h
-		in.mu.Unlock()
-	})
+	if hashOK {
+		in.goTask(func() {
+			t0 := time.Now()
+			h, err := analyze.HashFile(ctx, hashTarget)
+			in.timed("hash", t0, err)
+			in.mu.Lock()
+			r.Hashes = h
+			in.mu.Unlock()
+		})
+	}
 	switch {
 	case poly:
 		// The leading side is the file itself: always analysed in full,
@@ -175,6 +180,14 @@ func analyzeContainer(parent context.Context, eng *analyze.Engine, path string, 
 		in.inspectApp(path, r.FileName, true, false)
 	}
 	in.wait()
+	if f == detect.AppBundle && r.Hashes.SHA256 != "" {
+		// Metadata only, plus the seal file: cheap next to the analysis, and
+		// needed whatever the budget left, since it is the bundle's identity.
+		t0 := time.Now()
+		fp, err := bundleid.Fingerprint(path, r.Hashes.SHA256)
+		in.timed("bundle fingerprint", t0, err)
+		r.Hashes.Bundle = fp
+	}
 	in.finalize(start)
 	in.release()
 	return r
@@ -488,15 +501,37 @@ func contains(ss []string, s string) bool {
 	return false
 }
 
-// mainExecutable returns the path of a bundle's CFBundleExecutable.
-func mainExecutable(ctx context.Context, app string) string {
-	info, _ := readPlist(ctx, filepath.Join(app, "Contents", "Info.plist"))
-	return filepath.Join(app, "Contents", "MacOS", info["CFBundleExecutable"])
+// maxInfoPlist bounds the Info.plist read for a bundle's identity (the
+// Quick Look reader uses the same limit).
+const maxInfoPlist = 1 << 20
+
+// bundleExecutable returns the path of the main executable named by a
+// bundle's Info.plist values, and false when CFBundleExecutable does not
+// name a file directly inside Contents/MacOS.
+func bundleExecutable(app string, info map[string]string) (string, bool) {
+	name := info["CFBundleExecutable"]
+	if !bundleid.ValidExecutableName(name) {
+		return "", false
+	}
+	return filepath.Join(app, "Contents", "MacOS", name), true
 }
 
-// MainExecutable returns the path of an app bundle's CFBundleExecutable:
-// the file whose hash identifies the bundle.
-func MainExecutable(app string) string {
+// mainExecutable returns the path of a bundle's main executable. The
+// Info.plist must be a regular file (not a symbolic link) of reasonable
+// size, as the Quick Look reader requires.
+func mainExecutable(ctx context.Context, app string) (string, bool) {
+	p := filepath.Join(app, "Contents", "Info.plist")
+	if st, err := os.Lstat(p); err != nil || !st.Mode().IsRegular() || st.Size() > maxInfoPlist {
+		return "", false
+	}
+	info, _ := readPlist(ctx, p)
+	return bundleExecutable(app, info)
+}
+
+// MainExecutable returns the path of an app bundle's main executable, and
+// false when the bundle has none (no readable Info.plist, or a
+// CFBundleExecutable that is empty, ".", "..", or contains a slash).
+func MainExecutable(app string) (string, bool) {
 	return mainExecutable(context.Background(), app)
 }
 

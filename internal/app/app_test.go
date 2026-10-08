@@ -151,21 +151,30 @@ func (h *harness) quiet(t *testing.T, d time.Duration) {
 
 func checkIndexed(t *testing.T, x *index.Index, path string, e *index.Entry) {
 	t.Helper()
-	if !index.IsDigest(e.SHA256) {
-		t.Fatalf("entry has no digest: %+v", e)
+	if !index.IsDigest(e.EntryID) || !index.IsDigest(e.ContentKey) {
+		t.Fatalf("entry has no id or content key: %+v", e)
 	}
-	got, err := x.Get(e.SHA256)
+	got, err := x.Get(e.EntryID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Version != 1 || got.Path != path || got.Verdict != e.Verdict || got.ReportPath != e.ReportPath ||
-		got.BinchkVersion != "test" || got.FileName != filepath.Base(path) || got.Time().IsZero() {
+	if got.Version != 2 || got.Path != path || got.Verdict != e.Verdict || got.ReportPath != e.ReportPath ||
+		got.BinchkVersion != "test" || got.FileName != filepath.Base(path) || got.Time().IsZero() ||
+		got.EntryID != index.EntryID(path, got.ContentKey) || len(got.Paths) == 0 || got.Paths[0] != path {
 		t.Fatalf("index entry %+v", got)
+	}
+	// The content key is what a reader computes for the item.
+	key, kind, err := ContentKey(path)
+	if err != nil || key != got.ContentKey || kind != got.Kind {
+		t.Fatalf("content key %s %s %v; entry %s %s", key, kind, err, got.ContentKey, got.Kind)
+	}
+	if c, err := x.Content(key); err != nil || c.Entry != e.EntryID || c.Path != path {
+		t.Fatalf("content map %+v %v", c, err)
 	}
 	if _, err := os.Stat(got.ReportPath); err != nil {
 		t.Fatalf("full report: %v", err)
 	}
-	card, err := os.ReadFile(x.CardPath(e.SHA256))
+	card, err := os.ReadFile(x.CardPath(e.EntryID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,11 +185,11 @@ func checkIndexed(t *testing.T, x *index.Index, path string, e *index.Entry) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, _ := IdentityStat(path)
-	if p.SHA256 != e.SHA256 || !p.Matches(st) {
+	st, _ := IdentityState(path)
+	if p.Entry != e.EntryID || !p.Matches(st) {
 		t.Fatalf("pointer %+v does not match %s", p, path)
 	}
-	for _, f := range []string{x.EntryPath(e.SHA256), x.CardPath(e.SHA256), x.PointerPath(path)} {
+	for _, f := range []string{x.EntryPath(e.EntryID), x.CardPath(e.EntryID), x.PointerPath(path), x.ContentPath(e.ContentKey)} {
 		if st, err := os.Stat(f); err != nil || (runtime.GOOS != "windows" && st.Mode().Perm() != 0o644) {
 			t.Fatalf("%s: %v %v", f, st, err)
 		}
@@ -252,10 +261,10 @@ func TestEndToEnd(t *testing.T) {
 	}
 
 	// Mark as safe: allowlisted, untagged, recorded in the index.
-	if err := h.MarkSafe(e.SHA256); err != nil {
+	if err := h.MarkSafe(e.EntryID); err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := os.ReadFile(filepath.Join(h.root, "allowlist.txt")); !strings.Contains(string(b), e.SHA256) {
+	if b, _ := os.ReadFile(filepath.Join(h.root, "allowlist.txt")); !strings.Contains(string(b), e.ContentKey) {
 		t.Fatalf("allowlist: %q", b)
 	}
 	if findertag.Supported() {
@@ -263,11 +272,11 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("tag not removed: %q", got)
 		}
 	}
-	got, _ := h.Index().Get(e.SHA256)
+	got, _ := h.Index().Get(e.EntryID)
 	if !got.MarkedSafe {
 		t.Fatal("index entry not marked safe")
 	}
-	if card, _ := os.ReadFile(h.Index().CardPath(e.SHA256)); !strings.Contains(string(card), "marked this file as safe") {
+	if card, _ := os.ReadFile(h.Index().CardPath(e.EntryID)); !strings.Contains(string(card), "marked this file as safe") {
 		t.Fatal("card does not say it was marked safe")
 	}
 	if r := h.Recent(); !r[1].MarkedSafe {
@@ -353,7 +362,7 @@ func TestClearRecent(t *testing.T) {
 	if len(h.Recent()) != 0 {
 		t.Fatal("still in recent")
 	}
-	if _, err := h.Index().Get(e.SHA256); err != nil {
+	if _, err := h.Index().Get(e.EntryID); err != nil {
 		t.Fatal("index entry deleted")
 	}
 	if _, err := os.Stat(e.ReportPath); err != nil {
@@ -439,7 +448,7 @@ func TestLegacyMigration(t *testing.T) {
 }
 
 // An .app dropped into a watched folder is analysed as a unit, in place,
-// and indexed under its main executable.
+// and indexed under its bundle fingerprint, not its main executable.
 func TestBundleEndToEnd(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("app bundles are handled on macOS")
@@ -465,6 +474,9 @@ func TestBundleEndToEnd(t *testing.T) {
 		t.Fatalf("bundle not left in place: %v %v", st, err)
 	}
 	checkIndexed(t, h.Index(), target, e)
+	if e.Kind != index.KindBundle || e.ContentKey == e.SHA256 || e.SHA256 != fileSHA(t, filepath.Join(target, "Contents/MacOS/Tool")) {
+		t.Fatalf("bundle identity: kind %s, content key %s, main executable %s", e.Kind, e.ContentKey, e.SHA256)
+	}
 	if e.Verdict == "Suspicious" || e.Verdict == "Malicious" {
 		if got := tags(t, target); len(got) != 1 || !strings.HasPrefix(got[0], "binchk: ") {
 			t.Fatalf("bundle tags %q", got)

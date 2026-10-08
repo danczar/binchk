@@ -67,11 +67,15 @@ type Finding struct {
 	Evidence []string `json:"evidence,omitempty"`
 }
 
+// Hashes of the analysed file. For an app bundle, MD5, SHA1 and SHA256
+// are its main executable's, and Bundle is the bundle fingerprint (see
+// internal/bundleid), which identifies the bundle as a whole.
 type Hashes struct {
 	MD5     string `json:"md5,omitempty"`
 	SHA1    string `json:"sha1,omitempty"`
 	SHA256  string `json:"sha256,omitempty"`
 	Imphash string `json:"imphash,omitempty"`
+	Bundle  string `json:"bundle_fingerprint,omitempty"`
 }
 
 type Section struct {

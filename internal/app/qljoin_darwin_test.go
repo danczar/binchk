@@ -89,7 +89,7 @@ func TestQuickLookJoin(t *testing.T) {
 		t.Helper()
 		r := look(path)
 		ok := strings.Contains(r.HTML, "<h1>"+name+"</h1>") && strings.Contains(r.HTML, `class="pill">`+verdict+"<") &&
-			strings.Contains(r.HTML, "Matched by contents") == banner
+			strings.Contains(r.HTML, `<div class="match">Not checked at this location.`) == banner
 		if !ok {
 			t.Errorf("%s: want %s card (%s, banner %v); got %s:\n%s", path, name, verdict, banner, r.Outcome, excerpt(r.HTML))
 		}
@@ -131,8 +131,10 @@ func TestQuickLookJoin(t *testing.T) {
 		t.Fatalf("cp: %v %s", err, out)
 	}
 	r := expect(tcopy, "Trojan.app", "Malicious", true)
-	if !strings.Contains(r.HTML, "analysed as <b>Trojan.app</b>") {
-		t.Errorf("banner does not name the analysed item:\n%s", excerpt(r.HTML))
+	// An app matched by fingerprint: the banner names the copy the report
+	// belongs to and says the contents were not compared.
+	if !strings.Contains(r.HTML, "report for another copy, <b>Trojan.app</b>") || !strings.Contains(r.HTML, "file contents were not compared") {
+		t.Errorf("banner does not name the analysed item or overstates the match:\n%s", excerpt(r.HTML))
 	}
 	// A bundle changed after its analysis is not that bundle any more.
 	os.WriteFile(filepath.Join(benign, "Contents/Resources-added"), []byte("x"), 0o644)
@@ -166,7 +168,7 @@ func TestQuickLookJoin(t *testing.T) {
 	ecopy := filepath.Join(root, "elsewhere", "copy")
 	copyFile(t, evilSample, ecopy)
 	r = look(ecopy)
-	if !strings.Contains(r.HTML, "Matched by contents") || !strings.Contains(r.HTML, "odd&lt;img src=x&gt;&amp;&quot;q&quot;") ||
+	if !strings.Contains(r.HTML, "Same contents as <b>odd&lt;img src=x&gt;&amp;&quot;q&quot;</b>") ||
 		strings.Contains(r.HTML, "<img src=x>") {
 		t.Errorf("content fallback banner: %s\n%s", r.Outcome, excerpt(r.HTML))
 	}

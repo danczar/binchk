@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleDisplayName</key><string>binchk</string>
+  <key>CFBundleExecutable</key><string>BinchkPreview</string>
+  <key>CFBundleIdentifier</key><string>com.binchk.app.preview</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleName</key><string>BinchkPreview</string>
+  <key>CFBundlePackageType</key><string>XPC!</string>
+  <key>CFBundleShortVersionString</key><string>@VERSION@</string>
+  <key>CFBundleVersion</key><string>@VERSION@</string>
+  <key>CFBundleSupportedPlatforms</key><array><string>MacOSX</string></array>
+  <key>LSMinimumSystemVersion</key><string>@MACOS_MIN@</string>
+  <key>NSExtension</key>
+  <dict>
+    <key>NSExtensionPointIdentifier</key><string>com.apple.quicklook.preview</string>
+    <key>NSExtensionPrincipalClass</key><string>BinchkPreviewProvider</string>
+    <key>NSExtensionAttributes</key>
+    <dict>
+      <key>QLIsDataBasedPreview</key><true/>
+      <key>QLSupportsSearchableItems</key><false/>
+      <key>QLSupportedContentTypes</key>
+      <array>
+        <!-- Executables without an extension (Mach-O, ELF, ...) carry the
+             exec bit; macOS types them public.unix-executable. -->
+        <string>public.unix-executable</string>
+        <string>com.apple.mach-o-binary</string>
+        <string>com.apple.mach-o-executable</string>
+        <string>com.apple.mach-o-dylib</string>
+        <string>com.apple.mach-o-bundle</string>
+        <string>public.elf-binary</string>
+        <string>com.microsoft.windows-executable</string>
+        <string>com.microsoft.windows-dynamic-link-library</string>
+        <string>com.apple.application-bundle</string>
+        <string>com.apple.disk-image-udif</string>
+        <string>com.apple.installer-package-archive</string>
+      </array>
+    </dict>
+  </dict>
+</dict>
+</plist>

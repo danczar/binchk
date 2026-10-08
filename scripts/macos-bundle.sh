@@ -1,11 +1,14 @@
 #!/bin/sh
 # Wraps the macOS binary in a menu-bar-only .app bundle (no Dock icon).
 # usage: scripts/macos-bundle.sh path/to/binchk [version]
+# With APPEX=path/to/BinchkPreview.appex the Quick Look preview extension is
+# embedded at Contents/PlugIns (make app builds it first).
 set -eu
 BIN=${1:?usage: $0 path/to/binchk [version]}
 VERSION=${2:-dev}
 VERSION=${VERSION#v}   # Apple wants 0.1.0, not v0.1.0
 MACOS_MIN=${MACOS_MIN:-13.0}   # must match the binary's minos (Makefile)
+APPEX=${APPEX:-}
 APP=dist/binchk.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -29,6 +32,15 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 # Ad-hoc sign so it runs on Apple Silicon; replace "-" with a Developer ID
-# identity for distribution.
+# identity for distribution. Sign inside-out: the extension (with its sandbox
+# entitlements) first, then the app, whose seal covers the signed extension.
+if [ -n "$APPEX" ]; then
+  mkdir -p "$APP/Contents/PlugIns"
+  # No xattrs or resource forks: codesign --strict rejects that detritus.
+  ditto --norsrc --noextattr --noqtn --noacl "$APPEX" "$APP/Contents/PlugIns/BinchkPreview.appex"
+  codesign --force --sign - --options runtime \
+    --entitlements macos/QuickLook/BinchkPreview.entitlements \
+    "$APP/Contents/PlugIns/BinchkPreview.appex"
+fi
 codesign --force --sign - --options runtime "$APP"
 echo "built $APP"

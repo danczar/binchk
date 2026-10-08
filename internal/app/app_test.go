@@ -260,8 +260,17 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("recent %+v", r)
 	}
 
+	// A click carrying a trust key the entry no longer has (the item was
+	// swapped and re-analysed after the menu was built) is refused.
+	if err := h.MarkSafeAs(e.EntryID, strings.Repeat("0", 64)); err == nil {
+		t.Fatal("mark safe accepted a stale trust key")
+	}
+	if b, _ := os.ReadFile(filepath.Join(h.root, "allowlist.txt")); strings.Contains(string(b), e.TrustKey) {
+		t.Fatal("stale mark safe still allowlisted the item")
+	}
+
 	// Mark as safe: allowlisted, untagged, recorded in the index.
-	if err := h.MarkSafe(e.EntryID); err != nil {
+	if err := h.MarkSafeAs(e.EntryID, e.TrustKey); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(filepath.Join(h.root, "allowlist.txt")); !strings.Contains(string(b), e.TrustKey) || e.TrustKey != e.ContentKey {

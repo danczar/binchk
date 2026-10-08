@@ -296,7 +296,9 @@ func (u *ui) addItem(e *index.Entry) *itemUI {
 					opener.Reveal(e.Path)
 				}
 			case <-safe.ClickedCh:
-				if err := u.a.MarkSafe(e.EntryID); err != nil {
+				// The key shown in the menu: never trust contents swapped in
+				// after the menu was built.
+				if err := u.a.MarkSafeAs(e.EntryID, e.TrustKey); err != nil {
 					u.a.Log.Printf("mark safe: %v", err)
 				}
 			}

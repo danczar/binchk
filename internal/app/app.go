@@ -411,7 +411,13 @@ func NotificationBody(r *analyze.Report) string {
 // marked safe and its card re-rendered, and binchk's Finder tag comes off
 // every path those entries were recorded at that still holds exactly that
 // content.
-func (a *App) MarkSafe(id string) error {
+func (a *App) MarkSafe(id string) error { return a.MarkSafeAs(id, "") }
+
+// MarkSafeAs is MarkSafe for an entry the user saw with trust key want. An
+// item re-analysed in place keeps its entry ID, so if the contents changed
+// between building the menu and the click, the swapped-in contents must not
+// be trusted on the strength of the old report. An empty want skips the check.
+func (a *App) MarkSafeAs(id, want string) error {
 	if !index.IsDigest(id) {
 		return errors.New("no index entry to mark as safe")
 	}
@@ -419,10 +425,13 @@ func (a *App) MarkSafe(id string) error {
 	if err != nil {
 		return err
 	}
+	if want != "" && e.TrustKey != want {
+		return errors.New("this item changed and was analysed again since the menu was shown; check its new report before marking it as safe")
+	}
 	key := e.TrustKey
 	if !index.IsDigest(key) {
 		if e.Kind == index.KindBundle {
-			return errors.New("this app bundle's contents were not fully hashed; analyse it again before marking it as safe")
+			return errors.New("this app bundle's contents were not fully hashed (it is very large or was changing); run binchk scan on it, then mark it as safe")
 		}
 		return errors.New("no content hash to mark as safe")
 	}

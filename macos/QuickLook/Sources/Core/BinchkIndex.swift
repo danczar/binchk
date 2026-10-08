@@ -15,8 +15,9 @@
 //
 // A fresh path pointer leads straight to the item's own card. Otherwise the
 // content key is computed and the content map gives the most recent
-// analysis of the same content, which is shown with a "Matched by contents"
-// banner, since it may have been analysed elsewhere under another name.
+// analysis of the same content, shown under a "Not checked at this
+// location" banner that names that analysis. For an app the key covers only
+// file names and sizes, and the banner says so.
 //
 // This file is pure Foundation + CryptoKit so the command-line harness in
 // ../../Tests can exercise it outside the sandbox.
@@ -49,8 +50,9 @@ enum KeySource: Equatable, Sendable {
     /// Through the item's own path pointer.
     case pointer
     /// Through its content key: the most recent analysis of the same
-    /// content, at `path` on `analyzedAt` (RFC 3339).
-    case content(path: String, analyzedAt: String)
+    /// content, at `path` on `analyzedAt` (RFC 3339). For an app (`bundle`)
+    /// the key only covers file names and sizes, not their contents.
+    case content(path: String, analyzedAt: String, bundle: Bool)
 }
 
 enum PreviewOutcome: Equatable, Sendable {
@@ -113,8 +115,8 @@ struct BinchkIndex: Sendable {
         case .indexed(let id, let via):
             switch loadCard(entry: id) {
             case .success(var data):
-                if case .content(let p, let at) = via {
-                    data = Self.injectBanner(data, banner: Self.banner(analysedPath: p, analyzedAt: at))
+                if case .content(let p, let at, let bundle) = via {
+                    data = Self.injectBanner(data, banner: Self.banner(analysedPath: p, analyzedAt: at, bundle: bundle))
                 }
                 return PreviewResult(outcome: outcome, html: data)
             case .failure(let reason):
@@ -238,7 +240,7 @@ struct BinchkIndex: Sendable {
               head.kind == item.kind.rawValue, head.content_key == key,
               cardExists(ref.entry)
         else { return .notChecked(.noEntry) }
-        return .indexed(entry: ref.entry, via: .content(path: ref.path, analyzedAt: ref.analyzed_at))
+        return .indexed(entry: ref.entry, via: .content(path: ref.path, analyzedAt: ref.analyzed_at, bundle: item.kind == .bundle))
     }
 
     /// Absolute, with "." and ".." removed and no trailing slash, the way
@@ -330,8 +332,11 @@ struct BinchkIndex: Sendable {
     }
 
     /// The banner shown above a card found by content: where and when that
-    /// content was analysed. Everything in it is escaped.
-    static func banner(analysedPath: String, analyzedAt: String) -> String {
+    /// content was analysed, and how strong the match is. A file matched by
+    /// its SHA-256 has the same contents; an app matched by its fingerprint
+    /// only has the same file names and sizes, so the banner says the card
+    /// belongs to another copy. Everything in it is escaped.
+    static func banner(analysedPath: String, analyzedAt: String, bundle: Bool = false) -> String {
         let name = (analysedPath as NSString).lastPathComponent
         let folder = (analysedPath as NSString).deletingLastPathComponent
         var when = analyzedAt
@@ -341,7 +346,10 @@ struct BinchkIndex: Sendable {
             f.dateFormat = "d MMM yyyy, HH:mm"
             when = f.string(from: date)
         }
-        return "<div class=\"match\">Matched by contents — analysed as <b>\(escape(name))</b> in \(escape(folder)) on \(escape(when)).</div>"
+        if bundle {
+            return "<div class=\"match\">Not checked at this location. This is the report for another copy, <b>\(escape(name))</b> in \(escape(folder)) (\(escape(when))), with the same file names and sizes; file contents were not compared. Run binchk scan on this app to check it.</div>"
+        }
+        return "<div class=\"match\">Not checked at this location. Same contents as <b>\(escape(name))</b>, checked in \(escape(folder)) on \(escape(when)).</div>"
     }
 
     /// Puts banner at the top of the card.

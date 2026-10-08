@@ -111,7 +111,7 @@ do {
     addFilePointer(path: f, entry: fake, size: Int64(body.count), mtimeNs: 1_700_000_000_123_456_789)
     let r = idx.preview(forPath: f)
     check(r.outcome == .indexed(entry: fake, via: .pointer), "pointer hit: \(r.outcome)")
-    check(html(r).contains("card fake") && !html(r).contains("Matched by contents"), "pointer hit returns the stored card, no banner")
+    check(html(r).contains("card fake") && !html(r).contains("class=\"match\""), "pointer hit returns the stored card, no banner")
 
     // 2. Stale pointer (mtime moved): fall back to the content map, and say so.
     let real = id("real")
@@ -119,11 +119,11 @@ do {
     addContent(key: sha(body), entry: real, path: "/Users/u/Downloads/<b>orig&.bin")
     setMtime(f, sec: 1_700_000_001, nsec: 0)
     let r2 = idx.preview(forPath: f)
-    check(r2.outcome == .indexed(entry: real, via: .content(path: "/Users/u/Downloads/<b>orig&.bin", analyzedAt: "2026-10-08T13:03:04Z")), "stale mtime: \(r2.outcome)")
+    check(r2.outcome == .indexed(entry: real, via: .content(path: "/Users/u/Downloads/<b>orig&.bin", analyzedAt: "2026-10-08T13:03:04Z", bundle: false)), "stale mtime: \(r2.outcome)")
     let h2 = html(r2)
     check(h2.contains("card real"), "stale mtime returns the content match's card")
-    check(h2.contains("<div class=\"card\"><div class=\"match\">Matched by contents"), "banner at the top of the card")
-    check(h2.contains("analysed as <b>&lt;b&gt;orig&amp;.bin</b> in /Users/u/Downloads on "), "banner names the analysis, escaped: \(h2)")
+    check(h2.contains("<div class=\"card\"><div class=\"match\">Not checked at this location. Same contents as"), "banner at the top of the card")
+    check(h2.contains("Same contents as <b>&lt;b&gt;orig&amp;.bin</b>, checked in /Users/u/Downloads on "), "banner names the analysis, escaped: \(h2)")
     check(!h2.contains("<b>orig") && h2.contains("Oct 2026"), "no raw markup in the banner; a readable date")
 
     // Stale size (same mtime as the pointer): also by content.
@@ -239,8 +239,8 @@ do {
     addEntry(e, kind: "bundle", key: vectorFingerprint, label: "vector")
     addContent(key: vectorFingerprint, entry: e, path: "/Users/u/Downloads/Vector.app")
     let r = idx.preview(forPath: app)
-    check(r.outcome == .indexed(entry: e, via: .content(path: "/Users/u/Downloads/Vector.app", analyzedAt: "2026-10-08T13:03:04Z")), "bundle by fingerprint: \(r.outcome)")
-    check(html(r).contains("Matched by contents") && html(r).contains("card vector"), "bundle by fingerprint shows the banner")
+    check(r.outcome == .indexed(entry: e, via: .content(path: "/Users/u/Downloads/Vector.app", analyzedAt: "2026-10-08T13:03:04Z", bundle: true)), "bundle by fingerprint: \(r.outcome)")
+    check(html(r).contains("another copy") && html(r).contains("file contents were not compared") && html(r).contains("card vector"), "bundle by fingerprint shows the weaker banner")
 
     // A fresh bundle pointer: tree summary and main executable unchanged.
     let pe = id("vector-pointer")
